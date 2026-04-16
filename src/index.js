@@ -26,6 +26,14 @@ fs.mkdirSync(HLS_ROOT, { recursive: true });
 const sessions = new Map();
 let ffmpegAvailableCache = null;
 
+function log(...args) {
+  console.log('[worker]', ...args);
+}
+
+function logError(...args) {
+  console.error('[worker]', ...args);
+}
+
 function withBase(pathname) {
   return `${SERVER_A_INTERNAL_URL.replace(/\/$/, '')}${pathname}`;
 }
@@ -199,25 +207,33 @@ app.post('/transcode/start', async (req, res) => {
   const streamId = Number(req.body?.stream_id);
   const streamKey = String(req.body?.stream_key || '');
 
+  log('Received start request', { streamId, streamKey });
+
   if (!streamId || !streamKey) {
+    logError('Invalid start request payload', { body: req.body });
     return res.status(400).json({ error: 'stream_id and stream_key are required' });
   }
 
   if (!isFfmpegAvailable()) {
+    logError('FFmpeg not available, cannot start stream', { streamId });
     return res.status(500).json({
       error: 'ffmpeg binary not found. Install ffmpeg or run Server B via docker image.',
     });
   }
 
   if (sessions.has(streamId)) {
+    log('Start request ignored; stream already running', { streamId });
     return res.status(200).json({ success: true, stream_id: streamId, already_running: true });
   }
 
   const outputDir = outputDirForStream(streamId);
+  log('Preparing output directory', { streamId, outputDir });
   removeDir(outputDir);
   fs.mkdirSync(outputDir, { recursive: true });
+  log('Output directory ready', { streamId, outputDir });
 
   const ffmpegProcess = startFfmpegSession(streamId, streamKey, outputDir);
+  log('FFmpeg process spawned', { streamId, streamKey });
 
   const session = {
     streamId,
@@ -233,14 +249,15 @@ app.post('/transcode/start', async (req, res) => {
   session.interval = setInterval(() => {
     void sendHeartbeat(session);
   }, HEARTBEAT_INTERVAL_MS);
+  log('Heartbeat interval established', { streamId, intervalMs: HEARTBEAT_INTERVAL_MS });
 
   ffmpegProcess.on('exit', (code) => {
     const current = sessions.get(streamId);
     if (!current) return;
     clearInterval(current.interval);
     sessions.delete(streamId);
+    log('FFmpeg exited', { streamId, code });
     void notifyStreamEnded(streamId, Number(code || 0));
-    console.log(`FFmpeg exited for stream ${streamId} with code ${code}`);
   });
 
   ffmpegProcess.on('error', (error) => {
@@ -249,14 +266,14 @@ app.post('/transcode/start', async (req, res) => {
     clearInterval(current.interval);
     sessions.delete(streamId);
     const message = error instanceof Error ? error.message : String(error);
-    console.error(`FFmpeg failed for stream ${streamId}: ${message}`);
+    logError('FFmpeg failed during startup', { streamId, message });
     void notifyStreamEnded(streamId, 127);
   });
 
   sessions.set(streamId, session);
-  console.log(`Transcode session started for stream ${streamId}`);
+  log('Transcode session registered', { streamId, startedAt: session.startedAt });
 
-  // Send first heartbeat quickly so stream setup can continue.
+  log('Sending first heartbeat for new session', { streamId });
   await sendHeartbeat(session);
 
   return res.status(200).json({
@@ -268,33 +285,43 @@ app.post('/transcode/start', async (req, res) => {
 
 app.post('/transcode/stop', async (req, res) => {
   const streamId = Number(req.body?.stream_id);
+  log('Received stop request', { streamId });
+
   if (!streamId) {
+    logError('Invalid stop request payload', { body: req.body });
     return res.status(400).json({ error: 'stream_id is required' });
   }
 
   const session = sessions.get(streamId);
   if (!session) {
+    log('No active session found for stream; sending stream-ended notification', { streamId });
     await notifyStreamEnded(streamId, 0);
     return res.status(200).json({ success: true, stream_id: streamId, status: 'already_stopped' });
   }
 
+  log('Stopping active session', { streamId });
   clearInterval(session.interval);
+  log('Heartbeat interval cleared', { streamId });
   try {
     if (!session.ffmpegProcess.killed) {
+      log('Sending SIGTERM to FFmpeg process', { streamId });
       session.ffmpegProcess.kill('SIGTERM');
       setTimeout(() => {
         if (!session.ffmpegProcess.killed) {
+          log('SIGTERM did not stop FFmpeg; sending SIGKILL', { streamId });
           session.ffmpegProcess.kill('SIGKILL');
         }
       }, 2000);
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    console.error(`Failed to stop ffmpeg for stream ${streamId}: ${message}`);
+    logError('Failed to stop ffmpeg process', { streamId, message });
   }
+
   sessions.delete(streamId);
-  console.log(`Transcode session stopped for stream ${streamId}`);
+  log('Transcode session stopped and removed', { streamId });
   await notifyStreamEnded(streamId, 0);
+  log('Stream ended notification sent', { streamId });
 
   return res.status(200).json({
     success: true,
