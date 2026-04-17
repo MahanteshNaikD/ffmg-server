@@ -16,8 +16,11 @@ const SERVER_A_API_PREFIX = process.env.SERVER_A_API_PREFIX || '/api/v1';
 const HEARTBEAT_INTERVAL_MS = Number(process.env.HEARTBEAT_INTERVAL_MS || 2000);
 const RTMP_INPUT_BASE = process.env.RTMP_INPUT_BASE || 'rtmp://localhost/live';
 const HLS_ROOT = process.env.HLS_ROOT || path.join(process.cwd(), 'hls-output');
+const STREAM_RETENTION_MS = Number(process.env.STREAM_RETENTION_MS || 30 * 60 * 1000); // 30 minutes default
+const ARCHIVE_ROOT = path.join(HLS_ROOT, '.archives');
 
 fs.mkdirSync(HLS_ROOT, { recursive: true });
+fs.mkdirSync(ARCHIVE_ROOT, { recursive: true });
 
 /**
  * Active stream processing sessions keyed by stream id.
@@ -91,6 +94,38 @@ function countSegments(outputDir) {
     return files.filter((name) => name.endsWith('.ts') || name.endsWith('.m4s')).length;
   } catch {
     return 0;
+  }
+}
+
+function archiveDir(outputDir) {
+  try {
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const streamId = path.basename(outputDir);
+    const archivePath = path.join(ARCHIVE_ROOT, `${streamId}_${timestamp}`);
+    fs.renameSync(outputDir, archivePath);
+    log('Stream archived', { streamId, archivePath });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    logError('Failed to archive stream', { message });
+  }
+}
+
+function cleanupOldArchives() {
+  try {
+    const now = Date.now();
+    const files = fs.readdirSync(ARCHIVE_ROOT);
+    for (const file of files) {
+      const archivePath = path.join(ARCHIVE_ROOT, file);
+      const stat = fs.statSync(archivePath);
+      const age = now - stat.mtimeMs;
+      if (age > STREAM_RETENTION_MS) {
+        fs.rmSync(archivePath, { recursive: true, force: true });
+        log('Old archive deleted', { file, ageMs: age });
+      }
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    logError('Cleanup failed', { message });
   }
 }
 
@@ -228,7 +263,10 @@ app.post('/transcode/start', async (req, res) => {
 
   const outputDir = outputDirForStream(streamId);
   log('Preparing output directory', { streamId, outputDir });
-  removeDir(outputDir);
+  cleanupOldArchives();
+  if (fs.existsSync(outputDir)) {
+    removeDir(outputDir);
+  }
   fs.mkdirSync(outputDir, { recursive: true });
   log('Output directory ready', { streamId, outputDir });
 
@@ -257,6 +295,7 @@ app.post('/transcode/start', async (req, res) => {
     clearInterval(current.interval);
     sessions.delete(streamId);
     log('FFmpeg exited', { streamId, code });
+    archiveDir(current.outputDir);
     void notifyStreamEnded(streamId, Number(code || 0));
   });
 
@@ -267,6 +306,9 @@ app.post('/transcode/start', async (req, res) => {
     sessions.delete(streamId);
     const message = error instanceof Error ? error.message : String(error);
     logError('FFmpeg failed during startup', { streamId, message });
+    if (current.outputDir && fs.existsSync(current.outputDir)) {
+      archiveDir(current.outputDir);
+    }
     void notifyStreamEnded(streamId, 127);
   });
 
@@ -320,6 +362,7 @@ app.post('/transcode/stop', async (req, res) => {
 
   sessions.delete(streamId);
   log('Transcode session stopped and removed', { streamId });
+  archiveDir(session.outputDir);
   await notifyStreamEnded(streamId, 0);
   log('Stream ended notification sent', { streamId });
 
