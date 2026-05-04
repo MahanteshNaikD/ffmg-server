@@ -1,6 +1,7 @@
+require('dotenv').config();
+
 const express = require('express');
 const axios = require('axios');
-const dotenv = require('dotenv');
 const path = require('path');
 const fs = require('fs');
 const { spawn, spawnSync } = require('child_process');
@@ -12,8 +13,6 @@ const {
   isGcsEnabled,
   gcsConfig,
 } = require('./gcsSync');
-
-dotenv.config();
 
 const app = express();
 app.use(express.json());

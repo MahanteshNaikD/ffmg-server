@@ -1,8 +1,14 @@
 const path = require('path');
 const fs = require('fs');
 
-const BUCKET = (process.env.GCS_BUCKET || '').trim();
-const PREFIX = (process.env.GCS_HLS_PREFIX || 'live_stream').replace(/^\/+/, '').replace(/\/+$/, '');
+/** Read at use-time so `.env` is applied even if this module loads after dotenv in some entrypoints. */
+function gcsBucket() {
+  return (process.env.GCS_BUCKET || '').trim();
+}
+
+function gcsPrefix() {
+  return (process.env.GCS_HLS_PREFIX || 'live_stream').replace(/^\/+/, '').replace(/\/+$/, '');
+}
 
 let storageClient = null;
 let bucketRef = null;
@@ -17,22 +23,24 @@ function logGcsError(session, error) {
 }
 
 function isGcsEnabled() {
-  return Boolean(BUCKET);
+  return Boolean(gcsBucket());
 }
 
 function ensureBucket() {
-  if (!isGcsEnabled()) return null;
+  const name = gcsBucket();
+  if (!name) return null;
   if (!storageClient) {
     const { Storage } = require('@google-cloud/storage');
     storageClient = new Storage();
-    bucketRef = storageClient.bucket(BUCKET);
+    bucketRef = storageClient.bucket(name);
   }
   return bucketRef;
 }
 
 function objectPrefixForStream(streamId) {
   const id = String(streamId);
-  const base = PREFIX ? `${PREFIX}/${id}/` : `${id}/`;
+  const prefix = gcsPrefix();
+  const base = prefix ? `${prefix}/${id}/` : `${id}/`;
   return base.replace(/\/+/g, '/');
 }
 
@@ -141,16 +149,17 @@ async function flushGcsSync(session) {
  * @param {{ objectPrefix: string } | null} gcsState
  */
 function gcsPayloadForWebhook(streamId, gcsState) {
-  if (!isGcsEnabled() || !gcsState) return {};
+  const bucket = gcsBucket();
+  if (!bucket || !gcsState) return {};
   const prefix = gcsState.objectPrefix;
   const masterObject = `${prefix}master.m3u8`.replace(/\/+/g, '/');
   return {
     gcs: {
       enabled: true,
-      bucket: BUCKET,
+      bucket,
       object_prefix: prefix,
       master_manifest_object: masterObject,
-      gs_master_uri: `gs://${BUCKET}/${masterObject}`,
+      gs_master_uri: `gs://${bucket}/${masterObject}`,
       stream_id: streamId,
     },
   };
@@ -163,5 +172,5 @@ module.exports = {
   enqueueGcsSync,
   flushGcsSync,
   gcsPayloadForWebhook,
-  gcsConfig: () => ({ bucket: BUCKET || null, prefix: PREFIX }),
+  gcsConfig: () => ({ bucket: gcsBucket() || null, prefix: gcsPrefix() }),
 };
