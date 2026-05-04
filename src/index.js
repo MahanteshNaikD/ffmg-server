@@ -4,6 +4,14 @@ const dotenv = require('dotenv');
 const path = require('path');
 const fs = require('fs');
 const { spawn, spawnSync } = require('child_process');
+const {
+  createSessionGcsState,
+  enqueueGcsSync,
+  flushGcsSync,
+  gcsPayloadForWebhook,
+  isGcsEnabled,
+  gcsConfig,
+} = require('./gcsSync');
 
 dotenv.config();
 
@@ -59,12 +67,14 @@ async function postServerA(pathname, payload) {
 
 async function sendHeartbeat(session) {
   try {
+    void enqueueGcsSync(session);
     session.segmentsWritten = countSegments(session.outputDir);
     await postServerA('/internal/worker/heartbeat', {
       stream_id: session.streamId,
       segments_written: session.segmentsWritten,
       current_bitrate: session.currentBitrate,
       status: 'ok',
+      // ...gcsPayloadForWebhook(session.streamId, session.gcsState),
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -72,11 +82,12 @@ async function sendHeartbeat(session) {
   }
 }
 
-async function notifyStreamEnded(streamId, exitCode = 0) {
+async function notifyStreamEnded(streamId, exitCode = 0, sessionForGcs = null) {
   try {
     await postServerA('/internal/worker/stream-ended', {
       stream_id: streamId,
       exit_code: exitCode,
+      // ...gcsPayloadForWebhook(streamId, sessionForGcs?.gcsState ?? null),
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -282,6 +293,7 @@ app.post('/transcode/start', async (req, res) => {
     currentBitrate: 3200,
     interval: null,
     ffmpegProcess,
+    gcsState: createSessionGcsState(streamId),
   };
 
   session.interval = setInterval(() => {
@@ -295,8 +307,16 @@ app.post('/transcode/start', async (req, res) => {
     clearInterval(current.interval);
     sessions.delete(streamId);
     log('FFmpeg exited', { streamId, code });
-    archiveDir(current.outputDir);
-    void notifyStreamEnded(streamId, Number(code || 0));
+    void (async () => {
+      try {
+        await flushGcsSync(current);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        logError('GCS sync on ffmpeg exit failed', { streamId, message });
+      }
+      archiveDir(current.outputDir);
+      await notifyStreamEnded(streamId, Number(code || 0), current);
+    })();
   });
 
   ffmpegProcess.on('error', (error) => {
@@ -306,10 +326,20 @@ app.post('/transcode/start', async (req, res) => {
     sessions.delete(streamId);
     const message = error instanceof Error ? error.message : String(error);
     logError('FFmpeg failed during startup', { streamId, message });
-    if (current.outputDir && fs.existsSync(current.outputDir)) {
-      archiveDir(current.outputDir);
-    }
-    void notifyStreamEnded(streamId, 127);
+    void (async () => {
+      try {
+        if (current.outputDir && fs.existsSync(current.outputDir)) {
+          await flushGcsSync(current);
+        }
+      } catch (syncError) {
+        const syncMessage = syncError instanceof Error ? syncError.message : String(syncError);
+        logError('GCS sync after ffmpeg error failed', { streamId, message: syncMessage });
+      }
+      if (current.outputDir && fs.existsSync(current.outputDir)) {
+        archiveDir(current.outputDir);
+      }
+      await notifyStreamEnded(streamId, 127, current);
+    })();
   });
 
   sessions.set(streamId, session);
@@ -360,10 +390,17 @@ app.post('/transcode/stop', async (req, res) => {
     logError('Failed to stop ffmpeg process', { streamId, message });
   }
 
+  try {
+    await flushGcsSync(session);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    logError('GCS sync on transcode stop failed', { streamId, message });
+  }
+
   sessions.delete(streamId);
   log('Transcode session stopped and removed', { streamId });
   archiveDir(session.outputDir);
-  await notifyStreamEnded(streamId, 0);
+  await notifyStreamEnded(streamId, 0, session);
   log('Stream ended notification sent', { streamId });
 
   return res.status(200).json({
@@ -375,4 +412,7 @@ app.post('/transcode/stop', async (req, res) => {
 
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Server B worker running on port ${PORT}`);
+  if (isGcsEnabled()) {
+    log('GCS archive enabled', gcsConfig());
+  }
 });

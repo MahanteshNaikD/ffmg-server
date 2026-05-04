@@ -9,6 +9,7 @@
     "dev": "node --watch src/index.js"
   },
   "dependencies": {
+    "@google-cloud/storage": "^7.17.3",
     "axios": "^1.15.0",
     "dotenv": "^16.6.1",
     "express": "^4.21.2"
