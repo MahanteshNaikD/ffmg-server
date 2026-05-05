@@ -73,29 +73,45 @@ async function sendHeartbeat(session) {
       segments_written: session.segmentsWritten,
       current_bitrate: session.currentBitrate,
       status: 'ok',
-      ...gcsPayloadForWebhook(session.streamId),
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    console.error(`Heartbeat failed for stream ${session.streamId}: ${message}`);
+    const detail = error?.response?.data ? ` response=${JSON.stringify(error.response.data)}` : '';
+    console.error(`Heartbeat failed for stream ${session.streamId}: ${message}${detail}`);
   }
 }
 
 async function notifyStreamEnded(streamId, exitCode = 0) {
+  const basePayload = {
+    stream_id: streamId,
+    exit_code: exitCode,
+  };
+  const fullPayload = {
+    ...basePayload,
+    ...gcsPayloadForWebhook(streamId),
+  };
   try {
-    console.log('gcsPayloadForWebhook', {
-      stream_id: streamId,
-      exit_code: exitCode,
-      ...gcsPayloadForWebhook(streamId),
-    });
-    await postServerA('/internal/worker/stream-ended', {
-      stream_id: streamId,
-      exit_code: exitCode,
-      ...gcsPayloadForWebhook(streamId),
-    });
+    await postServerA('/internal/worker/stream-ended', fullPayload);
   } catch (error) {
+    if (error?.response?.status === 400) {
+      const detail = error?.response?.data ? JSON.stringify(error.response.data) : 'no response body';
+      logError(
+        'stream-ended webhook rejected extended payload; retrying with base DTO payload',
+        { streamId, detail }
+      );
+      try {
+        await postServerA('/internal/worker/stream-ended', basePayload);
+        return;
+      } catch (retryError) {
+        const retryMessage = retryError instanceof Error ? retryError.message : String(retryError);
+        const retryDetail = retryError?.response?.data ? ` response=${JSON.stringify(retryError.response.data)}` : '';
+        console.error(`stream-ended webhook retry failed for stream ${streamId}: ${retryMessage}${retryDetail}`);
+        return;
+      }
+    }
     const message = error instanceof Error ? error.message : String(error);
-    console.error(`stream-ended webhook failed for stream ${streamId}: ${message}`);
+    const detail = error?.response?.data ? ` response=${JSON.stringify(error.response.data)}` : '';
+    console.error(`stream-ended webhook failed for stream ${streamId}: ${message}${detail}`);
   }
 }
 
