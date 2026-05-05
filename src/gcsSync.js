@@ -160,7 +160,6 @@ function gcsPayloadForWebhook(streamId, gcsState) {
       object_prefix: prefix,
       master_manifest_object: masterObject,
       gs_master_uri: `gs://${bucket}/${masterObject}`,
-      stream_id: streamId,
     },
   };
 }

@@ -86,7 +86,7 @@ async function notifyStreamEnded(streamId, exitCode = 0, sessionForGcs = null) {
     await postServerA('/internal/worker/stream-ended', {
       stream_id: streamId,
       exit_code: exitCode,
-      // ...gcsPayloadForWebhook(streamId, sessionForGcs?.gcsState ?? null),
+      ...gcsPayloadForWebhook(streamId, sessionForGcs?.gcsState ?? null),
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
