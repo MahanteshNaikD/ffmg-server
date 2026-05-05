@@ -56,6 +56,7 @@ function objectPrefixForStream(streamId) {
 function contentTypeForName(name) {
   if (name.endsWith('.m3u8')) return 'application/vnd.apple.mpegurl';
   if (name.endsWith('.ts')) return 'video/mp2t';
+  if (name.endsWith('.jpg') || name.endsWith('.jpeg')) return 'image/jpeg';
   return 'application/octet-stream';
 }
 
@@ -110,6 +111,7 @@ function createThumbnailFromSegment(inputPath, outputPath) {
 async function maybeCreateThumbnail(session) {
   const gcsState = session.gcsState;
   if (!gcsState) return;
+  if (!session.outputDir || !fs.existsSync(session.outputDir)) return;
   const now = Date.now();
   if (now - gcsState.lastThumbnailAtMs < thumbnailIntervalMs()) return;
 
@@ -135,6 +137,8 @@ async function syncOutputDirToGcs(session) {
   if (!bucket || !gcsState) return;
 
   const dir = session.outputDir;
+  if (!dir || !fs.existsSync(dir)) return;
+
   let names;
   try {
     names = fs.readdirSync(dir);
@@ -215,17 +219,13 @@ async function flushGcsSync(session) {
 function gcsPayloadForWebhook(streamId) {
   const id = Number(streamId);
   const bucket = gcsBucket();
-  if (!bucket) {
-    return {
-      gcs: {
-        enabled: false,
-        stream_id: id,
-      },
-    };
+  if (!bucket || !Number.isFinite(id)) {
+    return {};
   }
   const prefix = objectPrefixForStream(id);
   const masterObject = `${prefix}master.m3u8`.replace(/\/+/g, '/');
-  const thumbnailObject = `${prefix}${thumbnailName()}`.replace(/\/+/g, '/');
+  const thumbName = thumbnailName();
+  const thumbnailObject = `${prefix}${thumbName}`.replace(/\/+/g, '/');
   const cdnBase = (process.env.CDN_URL || '').replace(/\/+$/, '');
   const httpsMaster = cdnBase
     ? `${cdnBase}/${masterObject}`

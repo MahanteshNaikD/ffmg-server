@@ -34,6 +34,8 @@ fs.mkdirSync(ARCHIVE_ROOT, { recursive: true });
  * This simulates FFmpeg lifecycle and emits heartbeats to Server A.
  */
 const sessions = new Map();
+/** One in-flight finalize per stream; concurrent callers await the same promise so notify always runs once. */
+const finalizeInflight = new Map();
 let ffmpegAvailableCache = null;
 
 function log(...args) {
@@ -81,24 +83,38 @@ async function sendHeartbeat(session) {
   }
 }
 
+function streamEndedIncludeGcs() {
+  return process.env.STREAM_ENDED_INCLUDE_GCS !== 'false';
+}
+
 async function notifyStreamEnded(streamId, exitCode = 0) {
+  const sid = Number(streamId);
+  const code = Number(exitCode);
+  if (!Number.isFinite(sid)) {
+    logError('notifyStreamEnded skipped: invalid stream_id', { streamId });
+    return;
+  }
   const basePayload = {
-    stream_id: streamId,
-    exit_code: exitCode,
+    stream_id: sid,
+    exit_code: Number.isFinite(code) ? code : 0,
   };
-  const fullPayload = {
-    ...basePayload,
-    ...gcsPayloadForWebhook(streamId),
-  };
+  const gcsPart = streamEndedIncludeGcs() ? gcsPayloadForWebhook(sid) : {};
+  const fullPayload = { ...basePayload, ...gcsPart };
   try {
+    console.log('notifyStreamEnded', {
+      streamId,
+      exitCode,
+      ...gcsPayloadForWebhook(streamId),
+    });
     await postServerA('/internal/worker/stream-ended', fullPayload);
   } catch (error) {
-    if (error?.response?.status === 400) {
+    if (error?.response?.status === 400 && streamEndedIncludeGcs() && Object.keys(gcsPart).length > 0) {
       const detail = error?.response?.data ? JSON.stringify(error.response.data) : 'no response body';
-      logError(
-        'stream-ended webhook rejected extended payload; retrying with base DTO payload',
-        { streamId, detail }
-      );
+      logError('stream-ended rejected payload with gcs; retrying base fields only', {
+        streamId,
+        detail,
+        hint: 'Deploy StreamEndedDto with nested gcs, or set STREAM_ENDED_INCLUDE_GCS=false until then.',
+      });
       try {
         await postServerA('/internal/worker/stream-ended', basePayload);
         return;
@@ -113,6 +129,54 @@ async function notifyStreamEnded(streamId, exitCode = 0) {
     const detail = error?.response?.data ? ` response=${JSON.stringify(error.response.data)}` : '';
     console.error(`stream-ended webhook failed for stream ${streamId}: ${message}${detail}`);
   }
+}
+
+/**
+ * Flush GCS, archive output, notify backend once. Safe if /transcode/stop and ffmpeg exit race.
+ */
+async function finalizeTranscodeSession(streamId, session, exitCode) {
+  if (!session) {
+    return;
+  }
+  const existing = finalizeInflight.get(streamId);
+  if (existing) {
+    await existing;
+    return;
+  }
+
+  const run = (async () => {
+    try {
+      try {
+        clearInterval(session.interval);
+      } catch {
+        /* ignore */
+      }
+      sessions.delete(streamId);
+
+      try {
+        await flushGcsSync(session);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        logError('GCS sync on finalize failed', { streamId, message });
+      }
+
+      try {
+        if (session.outputDir && fs.existsSync(session.outputDir)) {
+          archiveDir(session.outputDir);
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        logError('Archive on finalize failed', { streamId, message });
+      }
+
+      await notifyStreamEnded(streamId, exitCode);
+    } finally {
+      finalizeInflight.delete(streamId);
+    }
+  })();
+
+  finalizeInflight.set(streamId, run);
+  await run;
 }
 
 function outputDirForStream(streamId) {
@@ -324,42 +388,16 @@ app.post('/transcode/start', async (req, res) => {
   ffmpegProcess.on('exit', (code) => {
     const current = sessions.get(streamId);
     if (!current) return;
-    clearInterval(current.interval);
-    sessions.delete(streamId);
     log('FFmpeg exited', { streamId, code });
-    void (async () => {
-      try {
-        await flushGcsSync(current);
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        logError('GCS sync on ffmpeg exit failed', { streamId, message });
-      }
-      archiveDir(current.outputDir);
-      await notifyStreamEnded(streamId, Number(code || 0));
-    })();
+    void finalizeTranscodeSession(streamId, current, Number(code || 0));
   });
 
   ffmpegProcess.on('error', (error) => {
     const current = sessions.get(streamId);
     if (!current) return;
-    clearInterval(current.interval);
-    sessions.delete(streamId);
     const message = error instanceof Error ? error.message : String(error);
     logError('FFmpeg failed during startup', { streamId, message });
-    void (async () => {
-      try {
-        if (current.outputDir && fs.existsSync(current.outputDir)) {
-          await flushGcsSync(current);
-        }
-      } catch (syncError) {
-        const syncMessage = syncError instanceof Error ? syncError.message : String(syncError);
-        logError('GCS sync after ffmpeg error failed', { streamId, message: syncMessage });
-      }
-      if (current.outputDir && fs.existsSync(current.outputDir)) {
-        archiveDir(current.outputDir);
-      }
-      await notifyStreamEnded(streamId, 127);
-    })();
+    void finalizeTranscodeSession(streamId, current, 127);
   });
 
   sessions.set(streamId, session);
@@ -392,7 +430,11 @@ app.post('/transcode/stop', async (req, res) => {
   }
 
   log('Stopping active session', { streamId });
-  clearInterval(session.interval);
+  try {
+    clearInterval(session.interval);
+  } catch {
+    /* ignore */
+  }
   log('Heartbeat interval cleared', { streamId });
   try {
     if (!session.ffmpegProcess.killed) {
@@ -410,17 +452,7 @@ app.post('/transcode/stop', async (req, res) => {
     logError('Failed to stop ffmpeg process', { streamId, message });
   }
 
-  try {
-    await flushGcsSync(session);
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    logError('GCS sync on transcode stop failed', { streamId, message });
-  }
-
-  sessions.delete(streamId);
-  log('Transcode session stopped and removed', { streamId });
-  archiveDir(session.outputDir);
-  await notifyStreamEnded(streamId, 0);
+  await finalizeTranscodeSession(streamId, session, 0);
   log('Stream ended notification sent', { streamId });
 
   return res.status(200).json({
