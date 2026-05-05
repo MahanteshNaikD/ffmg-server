@@ -1,5 +1,6 @@
 const path = require('path');
 const fs = require('fs');
+const { spawn } = require('child_process');
 
 /** Read at use-time so `.env` is applied even if this module loads after dotenv in some entrypoints. */
 function gcsBucket() {
@@ -8,6 +9,14 @@ function gcsBucket() {
 
 function gcsPrefix() {
   return (process.env.GCS_HLS_PREFIX || 'live_stream').replace(/^\/+/, '').replace(/\/+$/, '');
+}
+
+function thumbnailName() {
+  return process.env.GCS_THUMBNAIL_NAME || 'thumbnail.jpg';
+}
+
+function thumbnailIntervalMs() {
+  return Number(process.env.GCS_THUMBNAIL_INTERVAL_MS || 10000);
 }
 
 let storageClient = null;
@@ -52,6 +61,7 @@ function contentTypeForName(name) {
 
 function cacheControlForName(name) {
   if (name.endsWith('.m3u8')) return 'max-age=2, must-revalidate';
+  if (name.endsWith('.jpg') || name.endsWith('.jpeg')) return 'max-age=5, must-revalidate';
   return 'public, max-age=31536000, immutable';
 }
 
@@ -65,7 +75,54 @@ function createSessionGcsState(streamId) {
   return {
     objectPrefix: objectPrefixForStream(streamId),
     uploaded: new Map(),
+    lastThumbnailAtMs: 0,
+    lastThumbnailSource: '',
   };
+}
+
+/**
+ * @param {string} inputPath
+ * @param {string} outputPath
+ * @returns {Promise<void>}
+ */
+function createThumbnailFromSegment(inputPath, outputPath) {
+  return new Promise((resolve, reject) => {
+    const ff = spawn(
+      'ffmpeg',
+      ['-y', '-hide_banner', '-loglevel', 'error', '-i', inputPath, '-frames:v', '1', '-q:v', '4', outputPath],
+      { stdio: ['ignore', 'ignore', 'pipe'] }
+    );
+    let stderr = '';
+    ff.stderr.on('data', (chunk) => {
+      stderr += String(chunk || '');
+    });
+    ff.on('error', reject);
+    ff.on('exit', (code) => {
+      if (code === 0) return resolve();
+      reject(new Error(stderr.trim() || `ffmpeg exited with ${code}`));
+    });
+  });
+}
+
+/**
+ * @param {{ outputDir: string, gcsState: ReturnType<typeof createSessionGcsState> }} session
+ */
+async function maybeCreateThumbnail(session) {
+  const gcsState = session.gcsState;
+  if (!gcsState) return;
+  const now = Date.now();
+  if (now - gcsState.lastThumbnailAtMs < thumbnailIntervalMs()) return;
+
+  const files = fs.readdirSync(session.outputDir);
+  const segmentFiles = files.filter((name) => /\.(ts|m4s)$/.test(name)).sort();
+  const latestSegment = segmentFiles[segmentFiles.length - 1];
+  if (!latestSegment || latestSegment === gcsState.lastThumbnailSource) return;
+
+  const inputPath = path.join(session.outputDir, latestSegment);
+  const outputPath = path.join(session.outputDir, thumbnailName());
+  await createThumbnailFromSegment(inputPath, outputPath);
+  gcsState.lastThumbnailAtMs = now;
+  gcsState.lastThumbnailSource = latestSegment;
 }
 
 /**
@@ -85,8 +142,15 @@ async function syncOutputDirToGcs(session) {
     return;
   }
 
+  try {
+    await maybeCreateThumbnail(session);
+    names = fs.readdirSync(dir);
+  } catch (error) {
+    logGcsError(session, error);
+  }
+
   for (const name of names) {
-    if (!/\.(ts|m3u8)$/.test(name)) continue;
+    if (!/\.(ts|m3u8|jpe?g)$/.test(name)) continue;
     const fullPath = path.join(dir, name);
     let stat;
     try {
@@ -161,15 +225,26 @@ function gcsPayloadForWebhook(streamId) {
   }
   const prefix = objectPrefixForStream(id);
   const masterObject = `${prefix}master.m3u8`.replace(/\/+/g, '/');
-  const httpsMaster = `${process.env.CDN_URL}/${masterObject}`;
+  const thumbnailObject = `${prefix}${thumbnailName()}`.replace(/\/+/g, '/');
+  const cdnBase = (process.env.CDN_URL || '').replace(/\/+$/, '');
+  const httpsMaster = cdnBase
+    ? `${cdnBase}/${masterObject}`
+    : `https://storage.googleapis.com/${bucket}/${masterObject}`;
+  const httpsThumbnail = cdnBase
+    ? `${cdnBase}/${thumbnailObject}`
+    : `https://storage.googleapis.com/${bucket}/${thumbnailObject}`;
   return {
     gcs: {
       enabled: true,
+      stream_id: id,
       bucket,
       object_prefix: prefix,
       master_manifest_object: masterObject,
+      thumbnail_object: thumbnailObject,
       gs_master_uri: `gs://${bucket}/${masterObject}`,
+      gs_thumbnail_uri: `gs://${bucket}/${thumbnailObject}`,
       https_master_uri: httpsMaster,
+      https_thumbnail_uri: httpsThumbnail,
     },
   };
 }
