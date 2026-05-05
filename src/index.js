@@ -83,7 +83,11 @@ async function sendHeartbeat(session) {
 
 async function notifyStreamEnded(streamId, exitCode = 0) {
   try {
-    console.log('gcsPayloadForWebhook', gcsPayloadForWebhook(streamId));
+    console.log('gcsPayloadForWebhook', {
+      stream_id: streamId,
+      exit_code: exitCode,
+      ...gcsPayloadForWebhook(streamId),
+    });
     await postServerA('/internal/worker/stream-ended', {
       stream_id: streamId,
       exit_code: exitCode,
