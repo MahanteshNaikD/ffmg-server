@@ -73,7 +73,7 @@ async function sendHeartbeat(session) {
       segments_written: session.segmentsWritten,
       current_bitrate: session.currentBitrate,
       status: 'ok',
-      // ...gcsPayloadForWebhook(session.streamId, session.gcsState),
+      ...gcsPayloadForWebhook(session.streamId),
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -81,12 +81,12 @@ async function sendHeartbeat(session) {
   }
 }
 
-async function notifyStreamEnded(streamId, exitCode = 0, sessionForGcs = null) {
+async function notifyStreamEnded(streamId, exitCode = 0) {
   try {
     await postServerA('/internal/worker/stream-ended', {
       stream_id: streamId,
       exit_code: exitCode,
-      ...gcsPayloadForWebhook(streamId, sessionForGcs?.gcsState ?? null),
+      ...gcsPayloadForWebhook(streamId),
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -314,7 +314,7 @@ app.post('/transcode/start', async (req, res) => {
         logError('GCS sync on ffmpeg exit failed', { streamId, message });
       }
       archiveDir(current.outputDir);
-      await notifyStreamEnded(streamId, Number(code || 0), current);
+      await notifyStreamEnded(streamId, Number(code || 0));
     })();
   });
 
@@ -337,7 +337,7 @@ app.post('/transcode/start', async (req, res) => {
       if (current.outputDir && fs.existsSync(current.outputDir)) {
         archiveDir(current.outputDir);
       }
-      await notifyStreamEnded(streamId, 127, current);
+      await notifyStreamEnded(streamId, 127);
     })();
   });
 
@@ -399,7 +399,7 @@ app.post('/transcode/stop', async (req, res) => {
   sessions.delete(streamId);
   log('Transcode session stopped and removed', { streamId });
   archiveDir(session.outputDir);
-  await notifyStreamEnded(streamId, 0, session);
+  await notifyStreamEnded(streamId, 0);
   log('Stream ended notification sent', { streamId });
 
   return res.status(200).json({

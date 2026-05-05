@@ -38,7 +38,7 @@ gs://{GCS_BUCKET}/live_stream/42/v0_seg_000001.ts
 
 ## 3. Webhooks your other server receives
 
-The worker POSTs to Server A as today, with an extra **`gcs`** object when archiving is enabled.
+The worker POSTs to Server A as today, and always includes a **`gcs`** object (paths are derived from `stream_id` and env so they are present even when there is no in-memory session).
 
 ### 3.1 `POST /internal/worker/heartbeat` (and `/api/v1/internal/worker/heartbeat` fallback)
 
@@ -56,26 +56,33 @@ Example JSON body:
     "object_prefix": "live_stream/42/",
     "master_manifest_object": "live_stream/42/master.m3u8",
     "gs_master_uri": "gs://my-project-live-archive/live_stream/42/master.m3u8",
+    "https_master_uri": "https://storage.googleapis.com/my-project-live-archive/live_stream/42/master.m3u8",
     "stream_id": 42
   }
 }
 ```
 
-Your API should persist at least: `stream_id`, `gcs.bucket`, `gcs.object_prefix` (or `gcs.master_manifest_object`) so later you can list or sign URLs.
+If `GCS_BUCKET` is unset, `gcs.enabled` is `false` and only `gcs.stream_id` is set. When `gcs.enabled` is `true`, persist at least `gcs.bucket`, `gcs.object_prefix` (or `gcs.master_manifest_object`) for your DB / “update stream” logic.
 
 ### 3.2 `POST /internal/worker/stream-ended`
 
-Same `gcs` shape as above (from the last known session), plus:
+Same `gcs` shape as the heartbeat, plus `exit_code`:
 
 ```json
 {
   "stream_id": 42,
   "exit_code": 0,
-  "gcs": { "...": "..." }
+  "gcs": {
+    "enabled": true,
+    "stream_id": 42,
+    "bucket": "my-project-live-archive",
+    "object_prefix": "live_stream/42/",
+    "master_manifest_object": "live_stream/42/master.m3u8",
+    "gs_master_uri": "gs://my-project-live-archive/live_stream/42/master.m3u8",
+    "https_master_uri": "https://storage.googleapis.com/my-project-live-archive/live_stream/42/master.m3u8"
+  }
 }
 ```
-
-If `gcs` is absent, archiving was disabled or misconfigured.
 
 ---
 

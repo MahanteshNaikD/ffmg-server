@@ -144,15 +144,24 @@ async function flushGcsSync(session) {
 }
 
 /**
- * Fields to merge into heartbeat / stream-ended for Server A and other services.
- * @param {number} streamId
- * @param {{ objectPrefix: string } | null} gcsState
+ * GCS paths for a stream (for Server A to persist on heartbeat / stream-ended).
+ * Derived from stream_id + env only so payloads are valid even when no session object exists.
+ * @param {number|string} streamId
  */
-function gcsPayloadForWebhook(streamId, gcsState) {
+function gcsPayloadForWebhook(streamId) {
+  const id = Number(streamId);
   const bucket = gcsBucket();
-  if (!bucket || !gcsState) return {};
-  const prefix = gcsState.objectPrefix;
+  if (!bucket) {
+    return {
+      gcs: {
+        enabled: false,
+        stream_id: id,
+      },
+    };
+  }
+  const prefix = objectPrefixForStream(id);
   const masterObject = `${prefix}master.m3u8`.replace(/\/+/g, '/');
+  const httpsMaster = `${process.env.CDN_URL}/${masterObject}`;
   return {
     gcs: {
       enabled: true,
@@ -160,6 +169,7 @@ function gcsPayloadForWebhook(streamId, gcsState) {
       object_prefix: prefix,
       master_manifest_object: masterObject,
       gs_master_uri: `gs://${bucket}/${masterObject}`,
+      https_master_uri: httpsMaster,
     },
   };
 }
