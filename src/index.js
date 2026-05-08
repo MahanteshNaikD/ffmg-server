@@ -107,14 +107,12 @@ function liveUrlsForStream(streamId) {
 async function notifyStreamStarted(session) {
   const { streamId, startedAt } = session;
   const { liveUrl, thumbnailUrl } = liveUrlsForStream(streamId);
-  const gcs = gcsPayloadForWebhook(streamId)?.gcs;
   const payload = {
     stream_id: streamId,
     started_at: startedAt,
     status: 'live',
     live_url: liveUrl,
-    thumbnail_url: thumbnailUrl,
-    ...(gcs ? { gcs } : {}),
+    thumbnail_url: thumbnailUrl
   };
   try {
     await postServerA('/internal/worker/stream-started', payload);
