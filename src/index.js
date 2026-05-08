@@ -23,6 +23,7 @@ const SERVER_A_API_PREFIX = process.env.SERVER_A_API_PREFIX || '/api/v1';
 const HEARTBEAT_INTERVAL_MS = Number(process.env.HEARTBEAT_INTERVAL_MS || 2000);
 const RTMP_INPUT_BASE = process.env.RTMP_INPUT_BASE || 'rtmp://localhost/live';
 const HLS_ROOT = process.env.HLS_ROOT || path.join(process.cwd(), 'hls-output');
+const WORKER_PUBLIC_BASE_URL = (process.env.WORKER_PUBLIC_BASE_URL || process.env.CDN_URL || '').replace(/\/+$/, '');
 const STREAM_RETENTION_MS = Number(process.env.STREAM_RETENTION_MS || 30 * 60 * 1000); // 30 minutes default
 const ARCHIVE_ROOT = path.join(HLS_ROOT, '.archives');
 
@@ -80,6 +81,51 @@ async function sendHeartbeat(session) {
     const message = error instanceof Error ? error.message : String(error);
     const detail = error?.response?.data ? ` response=${JSON.stringify(error.response.data)}` : '';
     console.error(`Heartbeat failed for stream ${session.streamId}: ${message}${detail}`);
+  }
+}
+
+function liveUrlsForStream(streamId) {
+  const gcs = gcsPayloadForWebhook(streamId)?.gcs;
+  if (gcs?.https_master_uri) {
+    return {
+      liveUrl: gcs.https_master_uri,
+      thumbnailUrl: gcs.https_thumbnail_uri || null,
+    };
+  }
+  if (!WORKER_PUBLIC_BASE_URL) {
+    return {
+      liveUrl: null,
+      thumbnailUrl: null,
+    };
+  }
+  return {
+    liveUrl: `${WORKER_PUBLIC_BASE_URL}/hls/${streamId}/master.m3u8`,
+    thumbnailUrl: null,
+  };
+}
+
+async function notifyStreamStarted(session) {
+  const { streamId, startedAt } = session;
+  const { liveUrl, thumbnailUrl } = liveUrlsForStream(streamId);
+  const gcs = gcsPayloadForWebhook(streamId)?.gcs;
+  const payload = {
+    stream_id: streamId,
+    started_at: startedAt,
+    status: 'live',
+    live_url: liveUrl,
+    thumbnail_url: thumbnailUrl,
+    ...(gcs ? { gcs } : {}),
+  };
+  try {
+    await postServerA('/internal/worker/stream-started', payload);
+  } catch (error) {
+    if (error?.response?.status === 404) {
+      log('stream-started endpoint not found on Server A; skipping notify', { path: STREAM_STARTED_PATH });
+      return;
+    }
+    const message = error instanceof Error ? error.message : String(error);
+    const detail = error?.response?.data ? ` response=${JSON.stringify(error.response.data)}` : '';
+    console.error(`stream-started webhook failed for stream ${streamId}: ${message}${detail}`);
   }
 }
 
@@ -405,6 +451,7 @@ app.post('/transcode/start', async (req, res) => {
 
   log('Sending first heartbeat for new session', { streamId });
   await sendHeartbeat(session);
+  await notifyStreamStarted(session);
 
   return res.status(200).json({
     success: true,
