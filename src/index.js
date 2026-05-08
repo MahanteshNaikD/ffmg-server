@@ -58,10 +58,10 @@ function withApiPrefix(pathname) {
 
 async function postServerA(pathname, payload) {
   try {
-    return await axios.post(withBase(pathname), payload);
+    return await axios.post(withApiPrefix(pathname), payload);
   } catch (error) {
     if (error?.response?.status === 404) {
-      return axios.post(withApiPrefix(pathname), payload);
+      return axios.post(withBase(pathname), payload);
     }
     throw error;
   }
