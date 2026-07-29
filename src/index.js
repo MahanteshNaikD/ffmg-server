@@ -398,10 +398,31 @@ app.use('/hls', express.static(HLS_ROOT, { fallthrough: true }));
 app.post('/transcode/start', async (req, res) => {
   const streamId = Number(req.body?.streamId || req.body?.stream_id);
   const streamKey = String(req.body?.streamKey || req.body?.stream_key || '');
-  const rtmpInputBase = String(req.body?.rtmpInputBase || req.body?.rtmp_input_base || '');
-  const callbackBaseUrl = String(req.body?.callbackBaseUrl || req.body?.callback_base_url || '');
-  const bucket = String(req.body?.bucket || req.body?.gcs_bucket || '').trim();
-  const cdnUrl = String(req.body?.cdnUrl || req.body?.cdn_url || '').trim();
+  
+  // Fallbacks: if parameters are not present in request body, fall back to environment variables or defaults
+  const rtmpInputBase = String(
+    req.body?.rtmpInputBase || 
+    req.body?.rtmp_input_base || 
+    process.env.RTMP_INPUT_BASE || 
+    'rtmp://localhost/live'
+  );
+  const callbackBaseUrl = String(
+    req.body?.callbackBaseUrl || 
+    req.body?.callback_base_url || 
+    `${process.env.SERVER_A_INTERNAL_URL || 'http://localhost:3000'}${process.env.SERVER_A_API_PREFIX || '/api/v1'}`
+  );
+  const bucket = String(
+    req.body?.bucket || 
+    req.body?.gcs_bucket || 
+    process.env.GCS_BUCKET || 
+    ''
+  ).trim();
+  const cdnUrl = String(
+    req.body?.cdnUrl || 
+    req.body?.cdn_url || 
+    process.env.CDN_URL || 
+    ''
+  ).trim();
 
   // Mock a temporary session object for logging the incoming request validation status
   const tempSession = {
@@ -413,9 +434,9 @@ app.post('/transcode/start', async (req, res) => {
 
   logSession(tempSession, 'Received start request');
 
-  if (!streamId || !streamKey || !rtmpInputBase || !callbackBaseUrl) {
-    logSessionError(tempSession, 'Invalid start request payload');
-    return res.status(400).json({ error: 'streamId, streamKey, rtmpInputBase, and callbackBaseUrl are required' });
+  if (!streamId || !streamKey) {
+    logSessionError(tempSession, 'Invalid start request payload: streamId and streamKey are required');
+    return res.status(400).json({ error: 'streamId and streamKey are required' });
   }
 
   if (!isFfmpegAvailable()) {
@@ -503,7 +524,7 @@ app.post('/transcode/stop', async (req, res) => {
   const streamId = Number(req.body?.streamId || req.body?.stream_id);
   
   if (!streamId) {
-    console.error('[worker] Invalid stop request payload: stream_id/streamId is missing');
+    console.error('[worker] Invalid stop request payload: streamId is missing');
     return res.status(400).json({ error: 'streamId is required' });
   }
 
@@ -511,9 +532,13 @@ app.post('/transcode/stop', async (req, res) => {
   if (!session) {
     console.log(`[worker][streamId:${streamId}] No active session found to stop. Triggering mock callback.`);
     // Derive callback parameters if possible, otherwise use fallback defaults
-    const callbackBaseUrl = String(req.body?.callbackBaseUrl || req.body?.callback_base_url || `${process.env.SERVER_A_INTERNAL_URL || 'http://localhost:3000'}${process.env.SERVER_A_API_PREFIX || '/api/v1'}`);
-    const bucket = String(req.body?.bucket || req.body?.gcs_bucket || '').trim();
-    const cdnUrl = String(req.body?.cdnUrl || req.body?.cdn_url || '').trim();
+    const callbackBaseUrl = String(
+      req.body?.callbackBaseUrl || 
+      req.body?.callback_base_url || 
+      `${process.env.SERVER_A_INTERNAL_URL || 'http://localhost:3000'}${process.env.SERVER_A_API_PREFIX || '/api/v1'}`
+    );
+    const bucket = String(req.body?.bucket || req.body?.gcs_bucket || process.env.GCS_BUCKET || '').trim();
+    const cdnUrl = String(req.body?.cdnUrl || req.body?.cdn_url || process.env.CDN_URL || '').trim();
     await notifyStreamEnded(streamId, 0, callbackBaseUrl, bucket, cdnUrl);
     return res.status(200).json({ success: true, stream_id: streamId, status: 'already_stopped' });
   }
