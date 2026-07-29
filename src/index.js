@@ -36,13 +36,19 @@ let ffmpegAvailableCache = null;
 
 function formatError(error) {
   if (!error) return 'Unknown error';
+  const url = error.config?.url || 'unknown url';
+  const method = (error.config?.method || 'POST').toUpperCase();
+  
   if (error.response) {
-    return `Status ${error.response.status} (${error.response.statusText || 'Error'}): ${JSON.stringify(error.response.data)}`;
+    return `Status ${error.response.status} (${error.response.statusText || 'Error'}) on ${method} ${url}: ${JSON.stringify(error.response.data)}`;
   }
   if (error.request) {
-    return `No response received from server. Code: ${error.code || 'unknown'}, Address: ${error.address || 'unknown'}, Port: ${error.port || 'unknown'}, Message: ${error.message}`;
+    const connInfo = error.code ? `Code: ${error.code}` : 'unknown';
+    const address = error.address || (error.request?.socket?.remoteAddress) || 'unknown';
+    const port = error.port || (error.request?.socket?.remotePort) || 'unknown';
+    return `Connection failed on ${method} ${url}. Code: ${connInfo}, TargetAddress: ${address}, TargetPort: ${port}. Message: ${error.message}`;
   }
-  return error.message || String(error);
+  return `${error.message || String(error)} on ${method} ${url}`;
 }
 
 function deriveEnvironment(callbackBaseUrl) {
