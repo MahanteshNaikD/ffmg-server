@@ -34,6 +34,17 @@ const sessions = new Map();
 const finalizeInflight = new Map();
 let ffmpegAvailableCache = null;
 
+function formatError(error) {
+  if (!error) return 'Unknown error';
+  if (error.response) {
+    return `Status ${error.response.status} (${error.response.statusText || 'Error'}): ${JSON.stringify(error.response.data)}`;
+  }
+  if (error.request) {
+    return `No response received from server. Code: ${error.code || 'unknown'}, Address: ${error.address || 'unknown'}, Port: ${error.port || 'unknown'}, Message: ${error.message}`;
+  }
+  return error.message || String(error);
+}
+
 function deriveEnvironment(callbackBaseUrl) {
   if (!callbackBaseUrl) return 'unknown';
   const url = callbackBaseUrl.toLowerCase();
@@ -95,9 +106,7 @@ async function sendHeartbeat(session) {
       status: 'ok',
     }, session.config.callbackBaseUrl);
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    const detail = error?.response?.data ? ` response=${JSON.stringify(error.response.data)}` : '';
-    logSessionError(session, `Heartbeat failed: ${message}${detail}`);
+    logSessionError(session, `Heartbeat failed: ${formatError(error)}`);
   }
 }
 
@@ -140,9 +149,7 @@ async function notifyStreamStarted(session) {
       logSession(session, 'stream-started endpoint not found on Server A; skipping notify');
       return;
     }
-    const message = error instanceof Error ? error.message : String(error);
-    const detail = error?.response?.data ? ` response=${JSON.stringify(error.response.data)}` : '';
-    logSessionError(session, `stream-started webhook failed: ${message}${detail}`);
+    logSessionError(session, `stream-started webhook failed: ${formatError(error)}`);
   }
 }
 
@@ -168,21 +175,16 @@ async function notifyStreamEnded(streamId, exitCode = 0, callbackBaseUrl, bucket
     await postServerA('/internal/worker/stream-ended', fullPayload, callbackBaseUrl);
   } catch (error) {
     if (error?.response?.status === 400 && streamEndedIncludeGcs() && Object.keys(gcsPart).length > 0) {
-      const detail = error?.response?.data ? JSON.stringify(error.response.data) : 'no response body';
-      console.error(`[worker][streamId:${sid}] stream-ended rejected payload with gcs; retrying base fields only. Details: ${detail}`);
+      console.error(`[worker][streamId:${sid}] stream-ended rejected payload with gcs; retrying base fields only. Details: ${formatError(error)}`);
       try {
         await postServerA('/internal/worker/stream-ended', basePayload, callbackBaseUrl);
         return;
       } catch (retryError) {
-        const retryMessage = retryError instanceof Error ? retryError.message : String(retryError);
-        const retryDetail = retryError?.response?.data ? ` response=${JSON.stringify(retryError.response.data)}` : '';
-        console.error(`[worker][streamId:${sid}] stream-ended webhook retry failed: ${retryMessage}${retryDetail}`);
+        console.error(`[worker][streamId:${sid}] stream-ended webhook retry failed: ${formatError(retryError)}`);
         return;
       }
     }
-    const message = error instanceof Error ? error.message : String(error);
-    const detail = error?.response?.data ? ` response=${JSON.stringify(error.response.data)}` : '';
-    console.error(`[worker][streamId:${sid}] stream-ended webhook failed: ${message}${detail}`);
+    console.error(`[worker][streamId:${sid}] stream-ended webhook failed: ${formatError(error)}`);
   }
 }
 
