@@ -11,19 +11,14 @@ const {
   flushGcsSync,
   gcsPayloadForWebhook,
   isGcsEnabled,
-  gcsConfig,
 } = require('./gcsSync');
 
 const app = express();
 app.use(express.json());
 
 const PORT = Number(process.env.PORT || 8080);
-const SERVER_A_INTERNAL_URL = process.env.SERVER_A_INTERNAL_URL || 'http://localhost:3000';
-const SERVER_A_API_PREFIX = process.env.SERVER_A_API_PREFIX || '/api/v1';
 const HEARTBEAT_INTERVAL_MS = Number(process.env.HEARTBEAT_INTERVAL_MS || 2000);
-const RTMP_INPUT_BASE = process.env.RTMP_INPUT_BASE || 'rtmp://localhost/live';
 const HLS_ROOT = process.env.HLS_ROOT || path.join(process.cwd(), 'hls-output');
-const WORKER_PUBLIC_BASE_URL = (process.env.WORKER_PUBLIC_BASE_URL || process.env.CDN_URL || '').replace(/\/+$/, '');
 const STREAM_RETENTION_MS = Number(process.env.STREAM_RETENTION_MS || 30 * 60 * 1000); // 30 minutes default
 const ARCHIVE_ROOT = path.join(HLS_ROOT, '.archives');
 
@@ -39,29 +34,50 @@ const sessions = new Map();
 const finalizeInflight = new Map();
 let ffmpegAvailableCache = null;
 
-function log(...args) {
-  console.log('[worker]', ...args);
+function deriveEnvironment(callbackBaseUrl) {
+  if (!callbackBaseUrl) return 'unknown';
+  const url = callbackBaseUrl.toLowerCase();
+  if (url.includes('dev') || url.includes('localhost') || url.includes('127.0.0.1') || url.includes('10.138.0.2')) {
+    return 'development';
+  }
+  if (url.includes('prod') || url.includes('10.138.0.3')) {
+    return 'production';
+  }
+  return 'production';
 }
 
-function logError(...args) {
-  console.error('[worker]', ...args);
+function sessionLogPrefix(session) {
+  const env = deriveEnvironment(session.config.callbackBaseUrl);
+  return `[streamId:${session.streamId}][env:${env}][bucket:${session.config.bucket || 'none'}][rtmp:${session.config.rtmpInputBase}][out:${session.outputDir}]`;
 }
 
-function withBase(pathname) {
-  return `${SERVER_A_INTERNAL_URL.replace(/\/$/, '')}${pathname}`;
+function logSession(session, message, ...args) {
+  console.log(`${sessionLogPrefix(session)} ${message}`, ...args);
 }
 
-function withApiPrefix(pathname) {
-  const prefix = SERVER_A_API_PREFIX.startsWith('/') ? SERVER_A_API_PREFIX : `/${SERVER_A_API_PREFIX}`;
-  return `${SERVER_A_INTERNAL_URL.replace(/\/$/, '')}${prefix}${pathname}`;
+function logSessionError(session, message, ...args) {
+  console.error(`${sessionLogPrefix(session)} ${message}`, ...args);
 }
 
-async function postServerA(pathname, payload) {
+function withBase(pathname, callbackBaseUrl) {
   try {
-    return await axios.post(withApiPrefix(pathname), payload);
+    const url = new URL(callbackBaseUrl);
+    return `${url.origin}${pathname}`;
+  } catch {
+    return `${callbackBaseUrl}${pathname}`;
+  }
+}
+
+function withApiPrefix(pathname, callbackBaseUrl) {
+  return `${callbackBaseUrl.replace(/\/+$/, '')}${pathname}`;
+}
+
+async function postServerA(pathname, payload, callbackBaseUrl) {
+  try {
+    return await axios.post(withApiPrefix(pathname, callbackBaseUrl), payload);
   } catch (error) {
     if (error?.response?.status === 404) {
-      return axios.post(withBase(pathname), payload);
+      return axios.post(withBase(pathname, callbackBaseUrl), payload);
     }
     throw error;
   }
@@ -71,42 +87,44 @@ async function sendHeartbeat(session) {
   try {
     void enqueueGcsSync(session);
     session.segmentsWritten = countSegments(session.outputDir);
+    logSession(session, `Sending heartbeat. segments=${session.segmentsWritten}`);
     await postServerA('/internal/worker/heartbeat', {
       stream_id: session.streamId,
       segments_written: session.segmentsWritten,
       current_bitrate: session.currentBitrate,
       status: 'ok',
-    });
+    }, session.config.callbackBaseUrl);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     const detail = error?.response?.data ? ` response=${JSON.stringify(error.response.data)}` : '';
-    console.error(`Heartbeat failed for stream ${session.streamId}: ${message}${detail}`);
+    logSessionError(session, `Heartbeat failed: ${message}${detail}`);
   }
 }
 
-function liveUrlsForStream(streamId) {
-  const gcs = gcsPayloadForWebhook(streamId)?.gcs;
+function liveUrlsForStream(session) {
+  const gcs = gcsPayloadForWebhook(session.streamId, session.config.bucket, session.config.cdnUrl)?.gcs;
   if (gcs?.https_master_uri) {
     return {
       liveUrl: gcs.https_master_uri,
       thumbnailUrl: gcs.https_thumbnail_uri || null,
     };
   }
-  if (!WORKER_PUBLIC_BASE_URL) {
+  const cdnBase = (session.config.cdnUrl || '').replace(/\/+$/, '');
+  if (cdnBase) {
     return {
-      liveUrl: null,
+      liveUrl: `${cdnBase}/hls/${session.streamId}/master.m3u8`,
       thumbnailUrl: null,
     };
   }
   return {
-    liveUrl: `${WORKER_PUBLIC_BASE_URL}/hls/${streamId}/master.m3u8`,
+    liveUrl: null,
     thumbnailUrl: null,
   };
 }
 
 async function notifyStreamStarted(session) {
   const { streamId, startedAt } = session;
-  const { liveUrl, thumbnailUrl } = liveUrlsForStream(streamId);
+  const { liveUrl, thumbnailUrl } = liveUrlsForStream(session);
   const payload = {
     stream_id: streamId,
     started_at: startedAt,
@@ -115,15 +133,16 @@ async function notifyStreamStarted(session) {
     thumbnail_url: thumbnailUrl
   };
   try {
-    await postServerA('/internal/worker/stream-started', payload);
+    logSession(session, 'Sending stream-started notification');
+    await postServerA('/internal/worker/stream-started', payload, session.config.callbackBaseUrl);
   } catch (error) {
     if (error?.response?.status === 404) {
-      log('stream-started endpoint not found on Server A; skipping notify', { path: STREAM_STARTED_PATH });
+      logSession(session, 'stream-started endpoint not found on Server A; skipping notify');
       return;
     }
     const message = error instanceof Error ? error.message : String(error);
     const detail = error?.response?.data ? ` response=${JSON.stringify(error.response.data)}` : '';
-    console.error(`stream-started webhook failed for stream ${streamId}: ${message}${detail}`);
+    logSessionError(session, `stream-started webhook failed: ${message}${detail}`);
   }
 }
 
@@ -131,47 +150,39 @@ function streamEndedIncludeGcs() {
   return process.env.STREAM_ENDED_INCLUDE_GCS !== 'false';
 }
 
-async function notifyStreamEnded(streamId, exitCode = 0) {
+async function notifyStreamEnded(streamId, exitCode = 0, callbackBaseUrl, bucket, cdnUrl) {
   const sid = Number(streamId);
   const code = Number(exitCode);
   if (!Number.isFinite(sid)) {
-    logError('notifyStreamEnded skipped: invalid stream_id', { streamId });
+    console.error(`[worker][streamId:${streamId}] notifyStreamEnded skipped: invalid stream_id`);
     return;
   }
   const basePayload = {
     stream_id: sid,
     exit_code: Number.isFinite(code) ? code : 0,
   };
-  const gcsPart = streamEndedIncludeGcs() ? gcsPayloadForWebhook(sid) : {};
+  const gcsPart = streamEndedIncludeGcs() ? gcsPayloadForWebhook(sid, bucket, cdnUrl) : {};
   const fullPayload = { ...basePayload, ...gcsPart };
   try {
-    console.log('notifyStreamEnded', {
-      streamId,
-      exitCode,
-      ...gcsPayloadForWebhook(streamId),
-    });
-    await postServerA('/internal/worker/stream-ended', fullPayload);
+    console.log(`[worker][streamId:${sid}][env:${deriveEnvironment(callbackBaseUrl)}] notifyStreamEnded: exitCode=${exitCode}`);
+    await postServerA('/internal/worker/stream-ended', fullPayload, callbackBaseUrl);
   } catch (error) {
     if (error?.response?.status === 400 && streamEndedIncludeGcs() && Object.keys(gcsPart).length > 0) {
       const detail = error?.response?.data ? JSON.stringify(error.response.data) : 'no response body';
-      logError('stream-ended rejected payload with gcs; retrying base fields only', {
-        streamId,
-        detail,
-        hint: 'Deploy StreamEndedDto with nested gcs, or set STREAM_ENDED_INCLUDE_GCS=false until then.',
-      });
+      console.error(`[worker][streamId:${sid}] stream-ended rejected payload with gcs; retrying base fields only. Details: ${detail}`);
       try {
-        await postServerA('/internal/worker/stream-ended', basePayload);
+        await postServerA('/internal/worker/stream-ended', basePayload, callbackBaseUrl);
         return;
       } catch (retryError) {
         const retryMessage = retryError instanceof Error ? retryError.message : String(retryError);
         const retryDetail = retryError?.response?.data ? ` response=${JSON.stringify(retryError.response.data)}` : '';
-        console.error(`stream-ended webhook retry failed for stream ${streamId}: ${retryMessage}${retryDetail}`);
+        console.error(`[worker][streamId:${sid}] stream-ended webhook retry failed: ${retryMessage}${retryDetail}`);
         return;
       }
     }
     const message = error instanceof Error ? error.message : String(error);
     const detail = error?.response?.data ? ` response=${JSON.stringify(error.response.data)}` : '';
-    console.error(`stream-ended webhook failed for stream ${streamId}: ${message}${detail}`);
+    console.error(`[worker][streamId:${sid}] stream-ended webhook failed: ${message}${detail}`);
   }
 }
 
@@ -198,22 +209,29 @@ async function finalizeTranscodeSession(streamId, session, exitCode) {
       sessions.delete(streamId);
 
       try {
+        logSession(session, 'Flushing dynamic GCS uploader files...');
         await flushGcsSync(session);
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
-        logError('GCS sync on finalize failed', { streamId, message });
+        logSessionError(session, `GCS sync on finalize failed: ${message}`);
       }
 
       try {
         if (session.outputDir && fs.existsSync(session.outputDir)) {
-          archiveDir(session.outputDir);
+          archiveDir(session.outputDir, session);
         }
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
-        logError('Archive on finalize failed', { streamId, message });
+        logSessionError(session, `Archive on finalize failed: ${message}`);
       }
 
-      await notifyStreamEnded(streamId, exitCode);
+      await notifyStreamEnded(
+        streamId, 
+        exitCode, 
+        session.config.callbackBaseUrl, 
+        session.config.bucket, 
+        session.config.cdnUrl
+      );
     } finally {
       finalizeInflight.delete(streamId);
     }
@@ -236,16 +254,16 @@ function countSegments(outputDir) {
   }
 }
 
-function archiveDir(outputDir) {
+function archiveDir(outputDir, session) {
   try {
     const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
     const streamId = path.basename(outputDir);
     const archivePath = path.join(ARCHIVE_ROOT, `${streamId}_${timestamp}`);
     fs.renameSync(outputDir, archivePath);
-    log('Stream archived', { streamId, archivePath });
+    logSession(session, `Stream directory archived to ${archivePath}`);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    logError('Failed to archive stream', { message });
+    logSessionError(session, `Failed to archive stream directory: ${message}`);
   }
 }
 
@@ -259,12 +277,12 @@ function cleanupOldArchives() {
       const age = now - stat.mtimeMs;
       if (age > STREAM_RETENTION_MS) {
         fs.rmSync(archivePath, { recursive: true, force: true });
-        log('Old archive deleted', { file, ageMs: age });
+        console.log('[worker] Old archive deleted', { file, ageMs: age });
       }
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    logError('Cleanup failed', { message });
+    console.error('[worker] Cleanup failed', { message });
   }
 }
 
@@ -272,8 +290,8 @@ function removeDir(outputDir) {
   fs.rmSync(outputDir, { recursive: true, force: true });
 }
 
-function buildInputUrl(streamKey) {
-  return `${RTMP_INPUT_BASE.replace(/\/$/, '')}/${streamKey}`;
+function buildInputUrl(rtmpInputBase, streamKey) {
+  return `${rtmpInputBase.replace(/\/$/, '')}/${streamKey}`;
 }
 
 function buildFfmpegArgs(inputUrl, outputDir) {
@@ -350,9 +368,9 @@ function isFfmpegAvailable() {
   return ffmpegAvailableCache;
 }
 
-function startFfmpegSession(streamId, streamKey, outputDir) {
-  const inputUrl = buildInputUrl(streamKey);
-  const ffmpegArgs = buildFfmpegArgs(inputUrl, outputDir);
+function startFfmpegSession(session) {
+  const inputUrl = buildInputUrl(session.config.rtmpInputBase, session.streamKey);
+  const ffmpegArgs = buildFfmpegArgs(inputUrl, session.outputDir);
   const processRef = spawn('ffmpeg', ffmpegArgs, {
     stdio: ['ignore', 'ignore', 'pipe'],
   });
@@ -360,7 +378,7 @@ function startFfmpegSession(streamId, streamKey, outputDir) {
   processRef.stderr.on('data', (chunk) => {
     const line = String(chunk || '').trim();
     if (line) {
-      console.log(`[ffmpeg:${streamId}] ${line}`);
+      console.log(`${sessionLogPrefix(session)}[ffmpeg] ${line}`);
     }
   });
 
@@ -378,39 +396,50 @@ app.get('/health', (_req, res) => {
 app.use('/hls', express.static(HLS_ROOT, { fallthrough: true }));
 
 app.post('/transcode/start', async (req, res) => {
-  const streamId = Number(req.body?.stream_id);
-  const streamKey = String(req.body?.stream_key || '');
+  const streamId = Number(req.body?.streamId || req.body?.stream_id);
+  const streamKey = String(req.body?.streamKey || req.body?.stream_key || '');
+  const rtmpInputBase = String(req.body?.rtmpInputBase || req.body?.rtmp_input_base || '');
+  const callbackBaseUrl = String(req.body?.callbackBaseUrl || req.body?.callback_base_url || '');
+  const bucket = String(req.body?.bucket || req.body?.gcs_bucket || '').trim();
+  const cdnUrl = String(req.body?.cdnUrl || req.body?.cdn_url || '').trim();
 
-  log('Received start request', { streamId, streamKey });
+  // Mock a temporary session object for logging the incoming request validation status
+  const tempSession = {
+    streamId: streamId || 0,
+    streamKey,
+    outputDir: outputDirForStream(streamId || 0),
+    config: { streamId, streamKey, rtmpInputBase, callbackBaseUrl, bucket, cdnUrl }
+  };
 
-  if (!streamId || !streamKey) {
-    logError('Invalid start request payload', { body: req.body });
-    return res.status(400).json({ error: 'stream_id and stream_key are required' });
+  logSession(tempSession, 'Received start request');
+
+  if (!streamId || !streamKey || !rtmpInputBase || !callbackBaseUrl) {
+    logSessionError(tempSession, 'Invalid start request payload');
+    return res.status(400).json({ error: 'streamId, streamKey, rtmpInputBase, and callbackBaseUrl are required' });
   }
 
   if (!isFfmpegAvailable()) {
-    logError('FFmpeg not available, cannot start stream', { streamId });
+    logSessionError(tempSession, 'FFmpeg not available, cannot start stream');
     return res.status(500).json({
       error: 'ffmpeg binary not found. Install ffmpeg or run Server B via docker image.',
     });
   }
 
   if (sessions.has(streamId)) {
-    log('Start request ignored; stream already running', { streamId });
+    logSession(tempSession, 'Start request ignored; stream already running');
     return res.status(200).json({ success: true, stream_id: streamId, already_running: true });
   }
 
   const outputDir = outputDirForStream(streamId);
-  log('Preparing output directory', { streamId, outputDir });
+  tempSession.outputDir = outputDir;
+  
+  logSession(tempSession, 'Preparing output directory');
   cleanupOldArchives();
   if (fs.existsSync(outputDir)) {
     removeDir(outputDir);
   }
   fs.mkdirSync(outputDir, { recursive: true });
-  log('Output directory ready', { streamId, outputDir });
-
-  const ffmpegProcess = startFfmpegSession(streamId, streamKey, outputDir);
-  log('FFmpeg process spawned', { streamId, streamKey });
+  logSession(tempSession, 'Output directory ready');
 
   const session = {
     streamId,
@@ -420,19 +449,31 @@ app.post('/transcode/start', async (req, res) => {
     segmentsWritten: 0,
     currentBitrate: 3200,
     interval: null,
-    ffmpegProcess,
-    gcsState: createSessionGcsState(streamId),
+    ffmpegProcess: null,
+    config: {
+      streamId,
+      streamKey,
+      rtmpInputBase,
+      callbackBaseUrl,
+      bucket,
+      cdnUrl
+    },
+    gcsState: createSessionGcsState(streamId, bucket, cdnUrl),
   };
+
+  const ffmpegProcess = startFfmpegSession(session);
+  session.ffmpegProcess = ffmpegProcess;
+  logSession(session, 'FFmpeg process spawned');
 
   session.interval = setInterval(() => {
     void sendHeartbeat(session);
   }, HEARTBEAT_INTERVAL_MS);
-  log('Heartbeat interval established', { streamId, intervalMs: HEARTBEAT_INTERVAL_MS });
+  logSession(session, `Heartbeat interval established: ${HEARTBEAT_INTERVAL_MS}ms`);
 
   ffmpegProcess.on('exit', (code) => {
     const current = sessions.get(streamId);
     if (!current) return;
-    log('FFmpeg exited', { streamId, code });
+    logSession(current, `FFmpeg exited with code ${code}`);
     void finalizeTranscodeSession(streamId, current, Number(code || 0));
   });
 
@@ -440,14 +481,14 @@ app.post('/transcode/start', async (req, res) => {
     const current = sessions.get(streamId);
     if (!current) return;
     const message = error instanceof Error ? error.message : String(error);
-    logError('FFmpeg failed during startup', { streamId, message });
+    logSessionError(current, `FFmpeg failed during startup: ${message}`);
     void finalizeTranscodeSession(streamId, current, 127);
   });
 
   sessions.set(streamId, session);
-  log('Transcode session registered', { streamId, startedAt: session.startedAt });
+  logSession(session, 'Transcode session registered');
 
-  log('Sending first heartbeat for new session', { streamId });
+  logSession(session, 'Sending first heartbeat for new session');
   await sendHeartbeat(session);
   await notifyStreamStarted(session);
 
@@ -459,46 +500,49 @@ app.post('/transcode/start', async (req, res) => {
 });
 
 app.post('/transcode/stop', async (req, res) => {
-  const streamId = Number(req.body?.stream_id);
-  log('Received stop request', { streamId });
-
+  const streamId = Number(req.body?.streamId || req.body?.stream_id);
+  
   if (!streamId) {
-    logError('Invalid stop request payload', { body: req.body });
-    return res.status(400).json({ error: 'stream_id is required' });
+    console.error('[worker] Invalid stop request payload: stream_id/streamId is missing');
+    return res.status(400).json({ error: 'streamId is required' });
   }
 
   const session = sessions.get(streamId);
   if (!session) {
-    log('No active session found for stream; sending stream-ended notification', { streamId });
-    await notifyStreamEnded(streamId, 0);
+    console.log(`[worker][streamId:${streamId}] No active session found to stop. Triggering mock callback.`);
+    // Derive callback parameters if possible, otherwise use fallback defaults
+    const callbackBaseUrl = String(req.body?.callbackBaseUrl || req.body?.callback_base_url || `${process.env.SERVER_A_INTERNAL_URL || 'http://localhost:3000'}${process.env.SERVER_A_API_PREFIX || '/api/v1'}`);
+    const bucket = String(req.body?.bucket || req.body?.gcs_bucket || '').trim();
+    const cdnUrl = String(req.body?.cdnUrl || req.body?.cdn_url || '').trim();
+    await notifyStreamEnded(streamId, 0, callbackBaseUrl, bucket, cdnUrl);
     return res.status(200).json({ success: true, stream_id: streamId, status: 'already_stopped' });
   }
 
-  log('Stopping active session', { streamId });
+  logSession(session, 'Stopping active session');
   try {
     clearInterval(session.interval);
   } catch {
     /* ignore */
   }
-  log('Heartbeat interval cleared', { streamId });
+  logSession(session, 'Heartbeat interval cleared');
   try {
     if (!session.ffmpegProcess.killed) {
-      log('Sending SIGTERM to FFmpeg process', { streamId });
+      logSession(session, 'Sending SIGTERM to FFmpeg process');
       session.ffmpegProcess.kill('SIGTERM');
       setTimeout(() => {
         if (!session.ffmpegProcess.killed) {
-          log('SIGTERM did not stop FFmpeg; sending SIGKILL', { streamId });
+          logSession(session, 'SIGTERM did not stop FFmpeg; sending SIGKILL');
           session.ffmpegProcess.kill('SIGKILL');
         }
       }, 2000);
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    logError('Failed to stop ffmpeg process', { streamId, message });
+    logSessionError(session, `Failed to stop ffmpeg process: ${message}`);
   }
 
   await finalizeTranscodeSession(streamId, session, 0);
-  log('Stream ended notification sent', { streamId });
+  logSession(session, 'Stream ended notification sent');
 
   return res.status(200).json({
     success: true,
@@ -509,7 +553,4 @@ app.post('/transcode/stop', async (req, res) => {
 
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Server B worker running on port ${PORT}`);
-  if (isGcsEnabled()) {
-    log('GCS archive enabled', gcsConfig());
-  }
 });

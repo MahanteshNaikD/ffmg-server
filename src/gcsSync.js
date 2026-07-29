@@ -2,11 +2,6 @@ const path = require('path');
 const fs = require('fs');
 const { spawn } = require('child_process');
 
-/** Read at use-time so `.env` is applied even if this module loads after dotenv in some entrypoints. */
-function gcsBucket() {
-  return (process.env.GCS_BUCKET || '').trim();
-}
-
 function gcsPrefix() {
   return (process.env.GCS_HLS_PREFIX || 'live_stream').replace(/^\/+/, '').replace(/\/+$/, '');
 }
@@ -20,7 +15,7 @@ function thumbnailIntervalMs() {
 }
 
 let storageClient = null;
-let bucketRef = null;
+const bucketRefs = new Map();
 
 /** @type {WeakMap<object, Promise<void>>} */
 const gcsUploadTail = new WeakMap();
@@ -31,19 +26,22 @@ function logGcsError(session, error) {
   console.error('[worker][gcs]', `stream ${id}`, message);
 }
 
-function isGcsEnabled() {
-  return Boolean(gcsBucket());
+function isGcsEnabled(bucketName) {
+  return Boolean(bucketName && bucketName.trim());
 }
 
-function ensureBucket() {
-  const name = gcsBucket();
-  if (!name) return null;
+function ensureBucket(bucketName) {
+  if (!bucketName) return null;
   if (!storageClient) {
     const { Storage } = require('@google-cloud/storage');
     storageClient = new Storage();
-    bucketRef = storageClient.bucket(name);
   }
-  return bucketRef;
+  let ref = bucketRefs.get(bucketName);
+  if (!ref) {
+    ref = storageClient.bucket(bucketName);
+    bucketRefs.set(bucketName, ref);
+  }
+  return ref;
 }
 
 function objectPrefixForStream(streamId) {
@@ -68,12 +66,16 @@ function cacheControlForName(name) {
 
 /**
  * @param {number|string} streamId
- * @returns {{ objectPrefix: string, uploaded: Map<string, { mtimeMs: number, size: number }> } | null}
+ * @param {string} bucket
+ * @param {string} cdnUrl
+ * @returns {{ bucket: string, cdnUrl: string, objectPrefix: string, uploaded: Map<string, { mtimeMs: number, size: number }> } | null}
  */
-function createSessionGcsState(streamId) {
-  if (!isGcsEnabled()) return null;
-  ensureBucket();
+function createSessionGcsState(streamId, bucket, cdnUrl) {
+  if (!isGcsEnabled(bucket)) return null;
+  ensureBucket(bucket);
   return {
+    bucket,
+    cdnUrl,
     objectPrefix: objectPrefixForStream(streamId),
     uploaded: new Map(),
     lastThumbnailAtMs: 0,
@@ -132,9 +134,10 @@ async function maybeCreateThumbnail(session) {
  * @param {{ outputDir: string, gcsState: ReturnType<typeof createSessionGcsState> }} session
  */
 async function syncOutputDirToGcs(session) {
-  const bucket = ensureBucket();
   const gcsState = session.gcsState;
-  if (!bucket || !gcsState) return;
+  if (!gcsState) return;
+  const bucket = ensureBucket(gcsState.bucket);
+  if (!bucket) return;
 
   const dir = session.outputDir;
   if (!dir || !fs.existsSync(dir)) return;
@@ -187,8 +190,8 @@ async function syncOutputDirToGcs(session) {
  * @returns {Promise<void>}
  */
 function enqueueGcsSync(session) {
-  if (!isGcsEnabled() || !session?.gcsState) return Promise.resolve();
-  if (!ensureBucket()) return Promise.resolve();
+  if (!session?.gcsState || !isGcsEnabled(session.gcsState.bucket)) return Promise.resolve();
+  if (!ensureBucket(session.gcsState.bucket)) return Promise.resolve();
   const prev = gcsUploadTail.get(session) || Promise.resolve();
   const next = prev.then(() =>
     syncOutputDirToGcs(session).catch((err) => {
@@ -204,8 +207,8 @@ function enqueueGcsSync(session) {
  * @param {{ outputDir: string, gcsState: ReturnType<typeof createSessionGcsState>, streamId?: number }} session
  */
 async function flushGcsSync(session) {
-  if (!isGcsEnabled() || !session?.gcsState) return;
-  if (!ensureBucket()) return;
+  if (!session?.gcsState || !isGcsEnabled(session.gcsState.bucket)) return;
+  if (!ensureBucket(session.gcsState.bucket)) return;
   const tail = enqueueGcsSync(session);
   await tail;
   gcsUploadTail.delete(session);
@@ -213,12 +216,13 @@ async function flushGcsSync(session) {
 
 /**
  * GCS paths for a stream (for Server A to persist on heartbeat / stream-ended).
- * Derived from stream_id + env only so payloads are valid even when no session object exists.
+ * Derived from stream_id + bucket + cdnUrl parameters.
  * @param {number|string} streamId
+ * @param {string} bucket
+ * @param {string} cdnUrl
  */
-function gcsPayloadForWebhook(streamId) {
+function gcsPayloadForWebhook(streamId, bucket, cdnUrl) {
   const id = Number(streamId);
-  const bucket = gcsBucket();
   if (!bucket || !Number.isFinite(id)) {
     return {};
   }
@@ -226,7 +230,7 @@ function gcsPayloadForWebhook(streamId) {
   const masterObject = `${prefix}master.m3u8`.replace(/\/+/g, '/');
   const thumbName = thumbnailName();
   const thumbnailObject = `${prefix}${thumbName}`.replace(/\/+/g, '/');
-  const cdnBase = (process.env.CDN_URL || '').replace(/\/+$/, '');
+  const cdnBase = (cdnUrl || '').replace(/\/+$/, '');
   const httpsMaster = cdnBase
     ? `${cdnBase}/${masterObject}`
     : `https://storage.googleapis.com/${bucket}/${masterObject}`;
@@ -252,5 +256,5 @@ module.exports = {
   enqueueGcsSync,
   flushGcsSync,
   gcsPayloadForWebhook,
-  gcsConfig: () => ({ bucket: gcsBucket() || null, prefix: gcsPrefix() }),
+  gcsConfig: (bucketName) => ({ bucket: bucketName || null, prefix: gcsPrefix() }),
 };
