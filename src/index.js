@@ -38,7 +38,7 @@ function formatError(error) {
   if (!error) return 'Unknown error';
   const url = error.config?.url || 'unknown url';
   const method = (error.config?.method || 'POST').toUpperCase();
-  
+
   if (error.response) {
     return `Status ${error.response.status} (${error.response.statusText || 'Error'}) on ${method} ${url}: ${JSON.stringify(error.response.data)}`;
   }
@@ -234,10 +234,10 @@ async function finalizeTranscodeSession(streamId, session, exitCode) {
       }
 
       await notifyStreamEnded(
-        streamId, 
-        exitCode, 
-        session.config.callbackBaseUrl, 
-        session.config.bucket, 
+        streamId,
+        exitCode,
+        session.config.callbackBaseUrl,
+        session.config.bucket,
         session.config.cdnUrl
       );
     } finally {
@@ -302,72 +302,128 @@ function buildInputUrl(rtmpInputBase, streamKey) {
   return `${rtmpInputBase.replace(/\/$/, '')}/${streamKey}`;
 }
 
+
 function buildFfmpegArgs(inputUrl, outputDir) {
   return [
     '-y',
+
     '-i',
     inputUrl,
+
+    // ─────────────────────────────
+    // Video encoding
+    // ─────────────────────────────
     '-preset',
     'veryfast',
+
     '-profile:v',
     'main',
+
     '-sc_threshold',
     '0',
+
+    // 2-second GOP for 2-second HLS segments
     '-g',
     '48',
+
     '-keyint_min',
     '48',
+
+    // ─────────────────────────────
+    // 720p
+    // ─────────────────────────────
     '-map',
     '0:v:0',
+
     '-map',
     '0:a?',
+
+    // ─────────────────────────────
+    // 480p
+    // ─────────────────────────────
     '-map',
     '0:v:0',
+
     '-map',
     '0:a?',
+
     '-c:v',
     'libx264',
+
     '-c:a',
     'aac',
+
     '-ar',
     '48000',
+
+    // 720p
     '-b:v:0',
     '3000k',
+
     '-maxrate:v:0',
     '3210k',
+
     '-bufsize:v:0',
     '4500k',
+
     '-s:v:0',
     '1280x720',
+
     '-b:a:0',
     '128k',
+
+    // 480p
     '-b:v:1',
     '1200k',
+
     '-maxrate:v:1',
     '1284k',
+
     '-bufsize:v:1',
     '1800k',
+
     '-s:v:1',
     '854x480',
+
     '-b:a:1',
     '96k',
+
+    // ─────────────────────────────
+    // Low-latency HLS
+    // ─────────────────────────────
     '-f',
     'hls',
+
+    // 1-second segments instead of 2 seconds
     '-hls_time',
-    '2',
+    '1',
+
+    // Keep only 4 segments in playlist
     '-hls_list_size',
-    '6',
+    '4',
+
     '-hls_flags',
     'delete_segments+independent_segments+append_list',
+
     '-master_pl_name',
     'master.m3u8',
+
     '-hls_segment_filename',
-    path.join(outputDir, 'v%v_seg_%06d.ts'),
+    path.join(
+      outputDir,
+      'v%v_seg_%06d.ts',
+    ),
+
     '-var_stream_map',
     'v:0,a:0,name:720p v:1,a:1,name:480p',
-    path.join(outputDir, 'v%v.m3u8'),
+
+    path.join(
+      outputDir,
+      'v%v.m3u8',
+    ),
   ];
 }
+
 
 function isFfmpegAvailable() {
   if (ffmpegAvailableCache !== null) return ffmpegAvailableCache;
@@ -406,29 +462,29 @@ app.use('/hls', express.static(HLS_ROOT, { fallthrough: true }));
 app.post('/transcode/start', async (req, res) => {
   const streamId = Number(req.body?.streamId || req.body?.stream_id);
   const streamKey = String(req.body?.streamKey || req.body?.stream_key || '');
-  
+
   // Fallbacks: if parameters are not present in request body, fall back to environment variables or defaults
   const rtmpInputBase = String(
-    req.body?.rtmpInputBase || 
-    req.body?.rtmp_input_base || 
-    process.env.RTMP_INPUT_BASE || 
+    req.body?.rtmpInputBase ||
+    req.body?.rtmp_input_base ||
+    process.env.RTMP_INPUT_BASE ||
     'rtmp://localhost/live'
   );
   const callbackBaseUrl = String(
-    req.body?.callbackBaseUrl || 
-    req.body?.callback_base_url || 
+    req.body?.callbackBaseUrl ||
+    req.body?.callback_base_url ||
     `${process.env.SERVER_A_INTERNAL_URL || 'http://localhost:3000'}${process.env.SERVER_A_API_PREFIX || '/api/v1'}`
   );
   const bucket = String(
-    req.body?.bucket || 
-    req.body?.gcs_bucket || 
-    process.env.GCS_BUCKET || 
+    req.body?.bucket ||
+    req.body?.gcs_bucket ||
+    process.env.GCS_BUCKET ||
     ''
   ).trim();
   const cdnUrl = String(
-    req.body?.cdnUrl || 
-    req.body?.cdn_url || 
-    process.env.CDN_URL || 
+    req.body?.cdnUrl ||
+    req.body?.cdn_url ||
+    process.env.CDN_URL ||
     ''
   ).trim();
 
@@ -461,7 +517,7 @@ app.post('/transcode/start', async (req, res) => {
 
   const outputDir = outputDirForStream(streamId);
   tempSession.outputDir = outputDir;
-  
+
   logSession(tempSession, 'Preparing output directory');
   cleanupOldArchives();
   if (fs.existsSync(outputDir)) {
@@ -530,7 +586,7 @@ app.post('/transcode/start', async (req, res) => {
 
 app.post('/transcode/stop', async (req, res) => {
   const streamId = Number(req.body?.streamId || req.body?.stream_id);
-  
+
   if (!streamId) {
     console.error('[worker] Invalid stop request payload: streamId is missing');
     return res.status(400).json({ error: 'streamId is required' });
@@ -541,8 +597,8 @@ app.post('/transcode/stop', async (req, res) => {
     console.log(`[worker][streamId:${streamId}] No active session found to stop. Triggering mock callback.`);
     // Derive callback parameters if possible, otherwise use fallback defaults
     const callbackBaseUrl = String(
-      req.body?.callbackBaseUrl || 
-      req.body?.callback_base_url || 
+      req.body?.callbackBaseUrl ||
+      req.body?.callback_base_url ||
       `${process.env.SERVER_A_INTERNAL_URL || 'http://localhost:3000'}${process.env.SERVER_A_API_PREFIX || '/api/v1'}`
     );
     const bucket = String(req.body?.bucket || req.body?.gcs_bucket || process.env.GCS_BUCKET || '').trim();
