@@ -117,6 +117,16 @@ async function sendHeartbeat(session) {
 }
 
 function liveUrlsForStream(session) {
+  const directServer = process.env.LIVE_STREAM_DIRECT_SERVER !== 'false';
+  const cdnBase = (session.config.cdnUrl || '').replace(/\/+$/, '');
+
+  if (directServer && cdnBase) {
+    return {
+      liveUrl: `${cdnBase}/hls/${session.streamId}/master.m3u8`,
+      thumbnailUrl: null,
+    };
+  }
+
   const gcs = gcsPayloadForWebhook(session.streamId, session.config.bucket, session.config.cdnUrl)?.gcs;
   if (gcs?.https_master_uri) {
     return {
@@ -124,7 +134,6 @@ function liveUrlsForStream(session) {
       thumbnailUrl: gcs.https_thumbnail_uri || null,
     };
   }
-  const cdnBase = (session.config.cdnUrl || '').replace(/\/+$/, '');
   if (cdnBase) {
     return {
       liveUrl: `${cdnBase}/hls/${session.streamId}/master.m3u8`,
@@ -132,7 +141,7 @@ function liveUrlsForStream(session) {
     };
   }
   return {
-    liveUrl: null,
+    liveUrl: `/hls/${session.streamId}/master.m3u8`,
     thumbnailUrl: null,
   };
 }
@@ -497,7 +506,21 @@ app.get('/health', (_req, res) => {
   });
 });
 
-app.use('/hls', express.static(HLS_ROOT, { fallthrough: true }));
+app.use('/hls', (req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', '*');
+  if (req.method === 'OPTIONS') {
+    return res.sendStatus(204);
+  }
+
+  if (req.path.endsWith('.m3u8')) {
+    res.setHeader('Cache-Control', 'no-cache, no-store, max-age=0, must-revalidate');
+  } else if (req.path.endsWith('.ts') || req.path.endsWith('.m4s')) {
+    res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+  }
+  next();
+}, express.static(HLS_ROOT, { fallthrough: true }));
 
 app.post('/transcode/start', async (req, res) => {
   const streamId = Number(req.body?.streamId || req.body?.stream_id);
