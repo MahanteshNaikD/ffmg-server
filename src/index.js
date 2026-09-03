@@ -314,21 +314,6 @@ function buildFfmpegArgs(inputUrl, outputDir) {
   return [
     '-y',
 
-    // ─────────────────────────────
-    // Low-latency input flags (disable probing & buffers)
-    // ─────────────────────────────
-    '-fflags',
-    'nobuffer',
-
-    '-flags',
-    'low_delay',
-
-    '-probesize',
-    '32k',
-
-    '-analyzeduration',
-    '0',
-
     '-i',
     inputUrl,
 
