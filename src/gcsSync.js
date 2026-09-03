@@ -59,8 +59,8 @@ function contentTypeForName(name) {
 }
 
 function cacheControlForName(name) {
-  if (name.endsWith('.m3u8')) return 'max-age=2, must-revalidate';
-  if (name.endsWith('.jpg') || name.endsWith('.jpeg')) return 'max-age=5, must-revalidate';
+  if (name.endsWith('.m3u8')) return 'no-cache, no-store, max-age=0, must-revalidate';
+  if (name.endsWith('.jpg') || name.endsWith('.jpeg')) return 'max-age=2, must-revalidate';
   return 'public, max-age=31536000, immutable';
 }
 
@@ -80,6 +80,7 @@ function createSessionGcsState(streamId, bucket, cdnUrl) {
     uploaded: new Map(),
     lastThumbnailAtMs: 0,
     lastThumbnailSource: '',
+    thumbnailInProgress: false,
   };
 }
 
@@ -112,21 +113,26 @@ function createThumbnailFromSegment(inputPath, outputPath) {
  */
 async function maybeCreateThumbnail(session) {
   const gcsState = session.gcsState;
-  if (!gcsState) return;
+  if (!gcsState || gcsState.thumbnailInProgress) return;
   if (!session.outputDir || !fs.existsSync(session.outputDir)) return;
   const now = Date.now();
   if (now - gcsState.lastThumbnailAtMs < thumbnailIntervalMs()) return;
 
   const files = fs.readdirSync(session.outputDir);
-  const segmentFiles = files.filter((name) => /\.(ts|m4s)$/.test(name)).sort();
+  const segmentFiles = files.filter((name) => /\.(ts|m4s)$/.test(name) && !name.endsWith('.tmp')).sort();
   const latestSegment = segmentFiles[segmentFiles.length - 1];
   if (!latestSegment || latestSegment === gcsState.lastThumbnailSource) return;
 
-  const inputPath = path.join(session.outputDir, latestSegment);
-  const outputPath = path.join(session.outputDir, thumbnailName());
-  await createThumbnailFromSegment(inputPath, outputPath);
-  gcsState.lastThumbnailAtMs = now;
-  gcsState.lastThumbnailSource = latestSegment;
+  gcsState.thumbnailInProgress = true;
+  try {
+    const inputPath = path.join(session.outputDir, latestSegment);
+    const outputPath = path.join(session.outputDir, thumbnailName());
+    await createThumbnailFromSegment(inputPath, outputPath);
+    gcsState.lastThumbnailAtMs = Date.now();
+    gcsState.lastThumbnailSource = latestSegment;
+  } finally {
+    gcsState.thumbnailInProgress = false;
+  }
 }
 
 /**
@@ -142,6 +148,11 @@ async function syncOutputDirToGcs(session) {
   const dir = session.outputDir;
   if (!dir || !fs.existsSync(dir)) return;
 
+  // Run thumbnail creation in background without blocking segment upload queue
+  void maybeCreateThumbnail(session).catch((error) => {
+    logGcsError(session, error);
+  });
+
   let names;
   try {
     names = fs.readdirSync(dir);
@@ -149,15 +160,9 @@ async function syncOutputDirToGcs(session) {
     return;
   }
 
-  try {
-    await maybeCreateThumbnail(session);
-    names = fs.readdirSync(dir);
-  } catch (error) {
-    logGcsError(session, error);
-  }
-
   for (const name of names) {
     if (!/\.(ts|m3u8|jpe?g)$/.test(name)) continue;
+    if (name.endsWith('.tmp')) continue; // Ignore in-flight temporary segments
     const fullPath = path.join(dir, name);
     let stat;
     try {

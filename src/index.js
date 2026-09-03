@@ -214,6 +214,13 @@ async function finalizeTranscodeSession(streamId, session, exitCode) {
       } catch {
         /* ignore */
       }
+      if (session.watcher) {
+        try {
+          session.watcher.close();
+        } catch {
+          /* ignore */
+        }
+      }
       sessions.delete(streamId);
 
       try {
@@ -307,27 +314,51 @@ function buildFfmpegArgs(inputUrl, outputDir) {
   return [
     '-y',
 
+    // ─────────────────────────────
+    // Low-latency input flags (disable probing & buffers)
+    // ─────────────────────────────
+    '-fflags',
+    'nobuffer',
+
+    '-flags',
+    'low_delay',
+
+    '-probesize',
+    '32k',
+
+    '-analyzeduration',
+    '0',
+
     '-i',
     inputUrl,
 
     // ─────────────────────────────
-    // Video encoding
+    // Video encoding with zero-latency tuning
     // ─────────────────────────────
     '-preset',
     'veryfast',
 
+    '-tune',
+    'zerolatency',
+
     '-profile:v',
     'main',
+
+    '-bf',
+    '0',
 
     '-sc_threshold',
     '0',
 
-    // 2-second GOP for 2-second HLS segments
+    // 1-second GOP for true 1-second HLS segments
     '-g',
-    '48',
+    '30',
 
     '-keyint_min',
-    '48',
+    '30',
+
+    '-force_key_frames',
+    'expr:gte(t,n_forced*1)',
 
     // ─────────────────────────────
     // 720p
@@ -394,16 +425,16 @@ function buildFfmpegArgs(inputUrl, outputDir) {
     '-f',
     'hls',
 
-    // 1-second segments instead of 2 seconds
+    // 1-second segment target duration
     '-hls_time',
     '1',
 
-    // Keep only 4 segments in playlist
+    // Keep 3 segments in playlist to minimize playback edge delay
     '-hls_list_size',
-    '4',
+    '3',
 
     '-hls_flags',
-    'delete_segments+independent_segments+append_list',
+    'delete_segments+independent_segments+temp_file',
 
     '-master_pl_name',
     'master.m3u8',
@@ -422,6 +453,30 @@ function buildFfmpegArgs(inputUrl, outputDir) {
       'v%v.m3u8',
     ),
   ];
+}
+
+function startOutputDirWatcher(session) {
+  if (!session.outputDir || !fs.existsSync(session.outputDir)) return null;
+  let debounceTimer = null;
+  try {
+    const watcher = fs.watch(session.outputDir, (_eventType, filename) => {
+      if (!filename) return;
+      if (filename.endsWith('.tmp')) return; // Ignore temporary FFmpeg chunks
+      if (filename.endsWith('.m3u8') || filename.endsWith('.ts') || filename.endsWith('.m4s')) {
+        if (debounceTimer) clearTimeout(debounceTimer);
+        debounceTimer = setTimeout(() => {
+          void enqueueGcsSync(session);
+        }, 50); // Immediate 50ms upload trigger upon file generation
+      }
+    });
+    watcher.on('error', (err) => {
+      logSessionError(session, `Watcher error: ${err.message}`);
+    });
+    return watcher;
+  } catch (error) {
+    logSessionError(session, `Failed to attach directory watcher: ${error.message}`);
+    return null;
+  }
 }
 
 
@@ -535,6 +590,7 @@ app.post('/transcode/start', async (req, res) => {
     currentBitrate: 3200,
     interval: null,
     ffmpegProcess: null,
+    watcher: null,
     config: {
       streamId,
       streamKey,
@@ -548,7 +604,8 @@ app.post('/transcode/start', async (req, res) => {
 
   const ffmpegProcess = startFfmpegSession(session);
   session.ffmpegProcess = ffmpegProcess;
-  logSession(session, 'FFmpeg process spawned');
+  session.watcher = startOutputDirWatcher(session);
+  logSession(session, 'FFmpeg process spawned & directory watcher active');
 
   session.interval = setInterval(() => {
     void sendHeartbeat(session);
