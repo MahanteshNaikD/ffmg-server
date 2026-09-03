@@ -105,11 +105,15 @@ async function sendHeartbeat(session) {
     void enqueueGcsSync(session);
     session.segmentsWritten = countSegments(session.outputDir);
     logSession(session, `Sending heartbeat. segments=${session.segmentsWritten}`);
+    const { liveUrl, thumbnailUrl } = liveUrlsForStream(session);
     await postServerA('/internal/worker/heartbeat', {
       stream_id: session.streamId,
       segments_written: session.segmentsWritten,
       current_bitrate: session.currentBitrate,
       status: 'ok',
+      live_url: liveUrl,
+      thumbnail_url: thumbnailUrl,
+      ...gcsPayloadForWebhook(session.streamId, session.config.bucket, session.config.cdnUrl),
     }, session.config.callbackBaseUrl);
   } catch (error) {
     logSessionError(session, `Heartbeat failed: ${formatError(error)}`);
@@ -119,11 +123,12 @@ async function sendHeartbeat(session) {
 function liveUrlsForStream(session) {
   const directServer = process.env.LIVE_STREAM_DIRECT_SERVER !== 'false';
   const cdnBase = (session.config.cdnUrl || '').replace(/\/+$/, '');
+  const thumbName = process.env.GCS_THUMBNAIL_NAME || 'thumbnail.jpg';
 
   if (directServer && cdnBase) {
     return {
       liveUrl: `${cdnBase}/hls/${session.streamId}/master.m3u8`,
-      thumbnailUrl: null,
+      thumbnailUrl: `${cdnBase}/hls/${session.streamId}/${thumbName}`,
     };
   }
 
@@ -131,30 +136,32 @@ function liveUrlsForStream(session) {
   if (gcs?.https_master_uri) {
     return {
       liveUrl: gcs.https_master_uri,
-      thumbnailUrl: gcs.https_thumbnail_uri || null,
+      thumbnailUrl: gcs.https_thumbnail_uri || `${cdnBase}/${gcs.object_prefix}${thumbName}`,
     };
   }
   if (cdnBase) {
     return {
       liveUrl: `${cdnBase}/hls/${session.streamId}/master.m3u8`,
-      thumbnailUrl: null,
+      thumbnailUrl: `${cdnBase}/hls/${session.streamId}/${thumbName}`,
     };
   }
   return {
     liveUrl: `/hls/${session.streamId}/master.m3u8`,
-    thumbnailUrl: null,
+    thumbnailUrl: `/hls/${session.streamId}/${thumbName}`,
   };
 }
 
 async function notifyStreamStarted(session) {
   const { streamId, startedAt } = session;
   const { liveUrl, thumbnailUrl } = liveUrlsForStream(session);
+  const gcsPart = gcsPayloadForWebhook(session.streamId, session.config.bucket, session.config.cdnUrl);
   const payload = {
     stream_id: streamId,
     started_at: startedAt,
     status: 'live',
     live_url: liveUrl,
-    thumbnail_url: thumbnailUrl
+    thumbnail_url: thumbnailUrl,
+    ...gcsPart,
   };
   try {
     logSession(session, 'Sending stream-started notification');
