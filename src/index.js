@@ -326,6 +326,13 @@ function buildFfmpegArgs(inputUrl, outputDir) {
     '-i',
     inputUrl,
 
+    // Virtual silent audio track as fallback in case RTMP input has no audio/mic
+    '-f',
+    'lavfi',
+
+    '-i',
+    'anullsrc=channel_layout=stereo:sample_rate=48000',
+
     // ─────────────────────────────
     // Video encoding with zero-latency tuning
     // ─────────────────────────────
@@ -363,6 +370,9 @@ function buildFfmpegArgs(inputUrl, outputDir) {
     '-map',
     '0:a?',
 
+    '-map',
+    '1:a?',
+
     // ─────────────────────────────
     // 480p
     // ─────────────────────────────
@@ -371,6 +381,9 @@ function buildFfmpegArgs(inputUrl, outputDir) {
 
     '-map',
     '0:a?',
+
+    '-map',
+    '1:a?',
 
     '-c:v',
     'libx264',
