@@ -117,22 +117,14 @@ async function sendHeartbeat(session) {
 }
 
 function liveUrlsForStream(session) {
-  const directServer = process.env.LIVE_STREAM_DIRECT_SERVER !== 'false';
+  const gcs = gcsPayloadForWebhook(session.streamId, session.config.bucket, session.config.cdnUrl)?.gcs;
   const cdnBase = (session.config.cdnUrl || '').replace(/\/+$/, '');
   const thumbName = process.env.GCS_THUMBNAIL_NAME || 'thumbnail.jpg';
 
-  if (directServer && cdnBase) {
-    return {
-      liveUrl: `${cdnBase}/hls/${session.streamId}/master.m3u8`,
-      thumbnailUrl: `${cdnBase}/hls/${session.streamId}/${thumbName}`,
-    };
-  }
-
-  const gcs = gcsPayloadForWebhook(session.streamId, session.config.bucket, session.config.cdnUrl)?.gcs;
   if (gcs?.https_master_uri) {
     return {
       liveUrl: gcs.https_master_uri,
-      thumbnailUrl: gcs.https_thumbnail_uri || `${cdnBase}/${gcs.object_prefix}${thumbName}`,
+      thumbnailUrl: gcs.https_thumbnail_uri || (cdnBase ? `${cdnBase}/${gcs.object_prefix}${thumbName}` : `${gcs.object_prefix}${thumbName}`),
     };
   }
   if (cdnBase) {
