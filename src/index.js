@@ -106,14 +106,24 @@ async function sendHeartbeat(session) {
     session.segmentsWritten = countSegments(session.outputDir);
     logSession(session, `Sending heartbeat. segments=${session.segmentsWritten}`);
     const { liveUrl, thumbnailUrl } = liveUrlsForStream(session);
+    const gcsPart = gcsPayloadForWebhook(session.streamId, session.config.bucket, session.config.cdnUrl);
     await postServerA('/internal/worker/heartbeat', {
       stream_id: session.streamId,
+      streamId: session.streamId,
       segments_written: session.segmentsWritten,
+      segmentsWritten: session.segmentsWritten,
       current_bitrate: session.currentBitrate,
+      currentBitrate: session.currentBitrate,
       status: 'ok',
       live_url: liveUrl,
+      liveUrl: liveUrl,
+      hls_master_url: liveUrl,
+      hlsMasterUrl: liveUrl,
+      hls_url: liveUrl,
+      hlsUrl: liveUrl,
       thumbnail_url: thumbnailUrl,
-      ...gcsPayloadForWebhook(session.streamId, session.config.bucket, session.config.cdnUrl),
+      thumbnailUrl: thumbnailUrl,
+      ...gcsPart,
     }, session.config.callbackBaseUrl);
   } catch (error) {
     logSessionError(session, `Heartbeat failed: ${formatError(error)}`);
@@ -157,10 +167,18 @@ async function notifyStreamStarted(session) {
   const gcsPart = gcsPayloadForWebhook(session.streamId, session.config.bucket, session.config.cdnUrl);
   const payload = {
     stream_id: streamId,
+    streamId: streamId,
     started_at: startedAt,
+    startedAt: startedAt,
     status: 'live',
     live_url: liveUrl,
+    liveUrl: liveUrl,
+    hls_master_url: liveUrl,
+    hlsMasterUrl: liveUrl,
+    hls_url: liveUrl,
+    hlsUrl: liveUrl,
     thumbnail_url: thumbnailUrl,
+    thumbnailUrl: thumbnailUrl,
     ...gcsPart,
   };
   try {
