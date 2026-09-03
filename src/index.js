@@ -316,6 +316,13 @@ function buildFfmpegArgs(inputUrl, outputDir) {
   return [
     '-y',
 
+    // Allow FFmpeg to probe incoming RTMP stream for audio + video tracks
+    '-analyzeduration',
+    '3000000',
+
+    '-probesize',
+    '3000000',
+
     '-i',
     inputUrl,
 
