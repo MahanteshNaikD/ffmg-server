@@ -186,6 +186,8 @@ async function syncOutputDirToGcs(session) {
       },
     });
     gcsState.uploaded.set(name, { mtimeMs: stat.mtimeMs, size: stat.size });
+    const id = session?.streamId ?? '?';
+    console.log(`[worker][gcs][streamId:${id}] Uploaded ${name} (${stat.size} bytes) -> gs://${gcsState.bucket}/${objectName}`);
   }
 }
 

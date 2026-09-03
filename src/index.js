@@ -419,7 +419,7 @@ function buildFfmpegArgs(inputUrl, outputDir) {
     '3',
 
     '-hls_flags',
-    'delete_segments+independent_segments+temp_file',
+    'delete_segments+independent_segments',
 
     '-master_pl_name',
     'master.m3u8',
