@@ -204,7 +204,7 @@ async function syncOutputDirToGcs(session) {
 }
 
 function isLiveGcsSyncEnabled() {
-  return process.env.ENABLE_LIVE_GCS_SYNC === 'true';
+  return process.env.ENABLE_LIVE_GCS_SYNC !== 'false';
 }
 
 /**

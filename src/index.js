@@ -117,20 +117,10 @@ async function sendHeartbeat(session) {
 }
 
 function liveUrlsForStream(session) {
-  const isDirectServer = process.env.ENABLE_LIVE_GCS_SYNC !== 'true';
-  const directDomain = process.env.DIRECT_STREAM_BASE_URL || (session.config.cdnUrl ? session.config.cdnUrl : '');
-  const thumbName = process.env.GCS_THUMBNAIL_NAME || 'thumbnail.jpg';
-
-  if (isDirectServer) {
-    const base = (directDomain || '').replace(/\/+$/, '');
-    return {
-      liveUrl: base ? `${base}/hls/${session.streamId}/master.m3u8` : `/hls/${session.streamId}/master.m3u8`,
-      thumbnailUrl: base ? `${base}/hls/${session.streamId}/${thumbName}` : `/hls/${session.streamId}/${thumbName}`,
-    };
-  }
-
   const gcs = gcsPayloadForWebhook(session.streamId, session.config.bucket, session.config.cdnUrl)?.gcs;
   const cdnBase = (session.config.cdnUrl || '').replace(/\/+$/, '');
+  const thumbName = process.env.GCS_THUMBNAIL_NAME || 'thumbnail.jpg';
+
   if (gcs?.https_master_uri) {
     return {
       liveUrl: gcs.https_master_uri,
