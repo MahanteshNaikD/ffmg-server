@@ -117,10 +117,20 @@ async function sendHeartbeat(session) {
 }
 
 function liveUrlsForStream(session) {
-  const gcs = gcsPayloadForWebhook(session.streamId, session.config.bucket, session.config.cdnUrl)?.gcs;
-  const cdnBase = (session.config.cdnUrl || '').replace(/\/+$/, '');
+  const isDirectServer = process.env.ENABLE_LIVE_GCS_SYNC !== 'true';
+  const directDomain = process.env.DIRECT_STREAM_BASE_URL || (session.config.cdnUrl ? session.config.cdnUrl : '');
   const thumbName = process.env.GCS_THUMBNAIL_NAME || 'thumbnail.jpg';
 
+  if (isDirectServer) {
+    const base = (directDomain || '').replace(/\/+$/, '');
+    return {
+      liveUrl: base ? `${base}/hls/${session.streamId}/master.m3u8` : `/hls/${session.streamId}/master.m3u8`,
+      thumbnailUrl: base ? `${base}/hls/${session.streamId}/${thumbName}` : `/hls/${session.streamId}/${thumbName}`,
+    };
+  }
+
+  const gcs = gcsPayloadForWebhook(session.streamId, session.config.bucket, session.config.cdnUrl)?.gcs;
+  const cdnBase = (session.config.cdnUrl || '').replace(/\/+$/, '');
   if (gcs?.https_master_uri) {
     return {
       liveUrl: gcs.https_master_uri,
@@ -337,15 +347,15 @@ function buildFfmpegArgs(inputUrl, outputDir) {
     '-sc_threshold',
     '0',
 
-    // 1-second GOP for true 1-second HLS segments
+    // 2-second GOP for 2-second HLS segments
     '-g',
-    '30',
+    '60',
 
     '-keyint_min',
-    '30',
+    '60',
 
     '-force_key_frames',
-    'expr:gte(t,n_forced*1)',
+    'expr:gte(t,n_forced*2)',
 
     // ─────────────────────────────
     // 720p
@@ -412,13 +422,13 @@ function buildFfmpegArgs(inputUrl, outputDir) {
     '-f',
     'hls',
 
-    // 1-second segment target duration
+    // 2-second segment duration (optimal for smooth streaming without buffering)
     '-hls_time',
-    '1',
+    '2',
 
-    // Keep 3 segments in playlist to minimize playback edge delay
+    // Keep 5 segments (10s sliding window) to prevent player buffer starvation
     '-hls_list_size',
-    '3',
+    '5',
 
     '-hls_flags',
     'delete_segments+independent_segments',

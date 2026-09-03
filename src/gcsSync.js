@@ -160,9 +160,16 @@ async function syncOutputDirToGcs(session) {
     return;
   }
 
-  for (const name of names) {
-    if (!/\.(ts|m3u8|jpe?g)$/.test(name)) continue;
-    if (name.endsWith('.tmp')) continue; // Ignore in-flight temporary segments
+  // Separate files to upload video segments BEFORE playlists (so player never requests a segment before it exists in GCS)
+  const validFiles = names.filter((name) => /\.(ts|m4s|m3u8|jpe?g)$/.test(name) && !name.endsWith('.tmp'));
+  const segments = validFiles.filter((name) => /\.(ts|m4s)$/.test(name));
+  const images = validFiles.filter((name) => /\.(jpe?g)$/.test(name));
+  const playlists = validFiles.filter((name) => name.endsWith('.m3u8'));
+
+  const uploadOrder = [...segments, ...images, ...playlists];
+  const now = Date.now();
+
+  for (const name of uploadOrder) {
     const fullPath = path.join(dir, name);
     let stat;
     try {
@@ -175,6 +182,11 @@ async function syncOutputDirToGcs(session) {
     const prev = gcsState.uploaded.get(name);
     if (prev && prev.mtimeMs === stat.mtimeMs && prev.size === stat.size) continue;
 
+    // GCS enforces a 1 QPS mutation limit per object name. Throttle m3u8 updates to avoid 429 rate limits.
+    if (prev && name.endsWith('.m3u8') && now - (prev.uploadTimeMs || 0) < 1000) {
+      continue;
+    }
+
     const objectName = `${gcsState.objectPrefix}${name}`.replace(/\/+/g, '/');
     const buf = await fs.promises.readFile(fullPath);
     const file = bucket.file(objectName);
@@ -185,10 +197,14 @@ async function syncOutputDirToGcs(session) {
         cacheControl: cacheControlForName(name),
       },
     });
-    gcsState.uploaded.set(name, { mtimeMs: stat.mtimeMs, size: stat.size });
+    gcsState.uploaded.set(name, { mtimeMs: stat.mtimeMs, size: stat.size, uploadTimeMs: Date.now() });
     const id = session?.streamId ?? '?';
     console.log(`[worker][gcs][streamId:${id}] Uploaded ${name} (${stat.size} bytes) -> gs://${gcsState.bucket}/${objectName}`);
   }
+}
+
+function isLiveGcsSyncEnabled() {
+  return process.env.ENABLE_LIVE_GCS_SYNC === 'true';
 }
 
 /**
@@ -197,6 +213,7 @@ async function syncOutputDirToGcs(session) {
  * @returns {Promise<void>}
  */
 function enqueueGcsSync(session) {
+  if (!isLiveGcsSyncEnabled()) return Promise.resolve();
   if (!session?.gcsState || !isGcsEnabled(session.gcsState.bucket)) return Promise.resolve();
   if (!ensureBucket(session.gcsState.bucket)) return Promise.resolve();
   const prev = gcsUploadTail.get(session) || Promise.resolve();
@@ -216,8 +233,9 @@ function enqueueGcsSync(session) {
 async function flushGcsSync(session) {
   if (!session?.gcsState || !isGcsEnabled(session.gcsState.bucket)) return;
   if (!ensureBucket(session.gcsState.bucket)) return;
-  const tail = enqueueGcsSync(session);
-  await tail;
+  await syncOutputDirToGcs(session).catch((err) => {
+    logGcsError(session, err);
+  });
   gcsUploadTail.delete(session);
 }
 
