@@ -19,18 +19,13 @@ app.use(express.json());
 const PORT = Number(process.env.PORT || 8080);
 const HEARTBEAT_INTERVAL_MS = Number(process.env.HEARTBEAT_INTERVAL_MS || 2000);
 const HLS_ROOT = process.env.HLS_ROOT || path.join(process.cwd(), 'hls-output');
-const STREAM_RETENTION_MS = Number(process.env.STREAM_RETENTION_MS || 30 * 60 * 1000); // 30 minutes default
+const STREAM_RETENTION_MS = Number(process.env.STREAM_RETENTION_MS || 30 * 60 * 1000);
 const ARCHIVE_ROOT = path.join(HLS_ROOT, '.archives');
 
 fs.mkdirSync(HLS_ROOT, { recursive: true });
 fs.mkdirSync(ARCHIVE_ROOT, { recursive: true });
 
-/**
- * Active stream processing sessions keyed by stream id.
- * This simulates FFmpeg lifecycle and emits heartbeats to Server A.
- */
 const sessions = new Map();
-/** One in-flight finalize per stream; concurrent callers await the same promise so notify always runs once. */
 const finalizeInflight = new Map();
 let ffmpegAvailableCache = null;
 
@@ -56,9 +51,6 @@ function deriveEnvironment(callbackBaseUrl) {
   const url = callbackBaseUrl.toLowerCase();
   if (url.includes('dev') || url.includes('localhost') || url.includes('127.0.0.1') || url.includes('10.138.0.2')) {
     return 'development';
-  }
-  if (url.includes('prod') || url.includes('10.138.0.3')) {
-    return 'production';
   }
   return 'production';
 }
@@ -129,13 +121,13 @@ function liveUrlsForStream(session) {
   }
   if (cdnBase) {
     return {
-      liveUrl: `${cdnBase}/hls/${session.streamId}/master.m3u8`,
-      thumbnailUrl: `${cdnBase}/hls/${session.streamId}/${thumbName}`,
+      liveUrl: `${cdnBase}/live_stream/${session.streamId}/master.m3u8`,
+      thumbnailUrl: `${cdnBase}/live_stream/${session.streamId}/${thumbName}`,
     };
   }
   return {
-    liveUrl: `/hls/${session.streamId}/master.m3u8`,
-    thumbnailUrl: `/hls/${session.streamId}/${thumbName}`,
+    liveUrl: `/live_stream/${session.streamId}/master.m3u8`,
+    thumbnailUrl: `/live_stream/${session.streamId}/${thumbName}`,
   };
 }
 
@@ -183,7 +175,7 @@ async function notifyStreamEnded(streamId, exitCode = 0, callbackBaseUrl, bucket
     await postServerA('/internal/worker/stream-ended', fullPayload, callbackBaseUrl);
   } catch (error) {
     if (error?.response?.status === 400 && streamEndedIncludeGcs() && Object.keys(gcsPart).length > 0) {
-      console.error(`[worker][streamId:${sid}] stream-ended rejected payload with gcs; retrying base fields only. Details: ${formatError(error)}`);
+      console.error(`[worker][streamId:${sid}] stream-ended rejected payload; retrying base fields. Details: ${formatError(error)}`);
       try {
         await postServerA('/internal/worker/stream-ended', basePayload, callbackBaseUrl);
         return;
@@ -196,13 +188,8 @@ async function notifyStreamEnded(streamId, exitCode = 0, callbackBaseUrl, bucket
   }
 }
 
-/**
- * Flush GCS, archive output, notify backend once. Safe if /transcode/stop and ffmpeg exit race.
- */
 async function finalizeTranscodeSession(streamId, session, exitCode) {
-  if (!session) {
-    return;
-  }
+  if (!session) return;
   const existing = finalizeInflight.get(streamId);
   if (existing) {
     await existing;
@@ -211,17 +198,9 @@ async function finalizeTranscodeSession(streamId, session, exitCode) {
 
   const run = (async () => {
     try {
-      try {
-        clearInterval(session.interval);
-      } catch {
-        /* ignore */
-      }
+      try { clearInterval(session.interval); } catch { }
       if (session.watcher) {
-        try {
-          session.watcher.close();
-        } catch {
-          /* ignore */
-        }
+        try { session.watcher.close(); } catch { }
       }
       sessions.delete(streamId);
 
@@ -311,141 +290,58 @@ function buildInputUrl(rtmpInputBase, streamKey) {
   return `${rtmpInputBase.replace(/\/$/, '')}/${streamKey}`;
 }
 
-
 function buildFfmpegArgs(inputUrl, outputDir) {
   return [
     '-y',
+    '-analyzeduration', '3000000',
+    '-probesize', '3000000',
+    '-i', inputUrl,
 
-    // Allow FFmpeg to probe incoming RTMP stream for audio + video tracks
-    '-analyzeduration',
-    '3000000',
+    // Video encoding options
+    '-preset', 'veryfast',
+    '-tune', 'zerolatency',
+    '-profile:v', 'main',
+    '-bf', '0',
+    '-sc_threshold', '0',
 
-    '-probesize',
-    '3000000',
+    // Strict 2-second GOP aligned at 30 fps (60 frames)
+    '-g', '60',
+    '-keyint_min', '60',
+    '-force_key_frames', 'expr:gte(t,n_forced*2)',
 
-    '-i',
-    inputUrl,
+    // Video/Audio mappings
+    '-map', '0:v:0',
+    '-map', '0:a:0?',
+    '-map', '0:v:0',
+    '-map', '0:a:0?',
 
-    // ─────────────────────────────
-    // Video encoding with zero-latency tuning
-    // ─────────────────────────────
-    '-preset',
-    'veryfast',
+    '-c:v', 'libx264',
+    '-c:a', 'aac',
+    '-ar', '48000',
 
-    '-tune',
-    'zerolatency',
+    // 720p Settings
+    '-b:v:0', '3000k',
+    '-maxrate:v:0', '3210k',
+    '-bufsize:v:0', '4500k',
+    '-s:v:0', '1280x720',
+    '-b:a:0', '128k',
 
-    '-profile:v',
-    'main',
+    // 480p Settings
+    '-b:v:1', '1200k',
+    '-maxrate:v:1', '1284k',
+    '-bufsize:v:1', '1800k',
+    '-s:v:1', '854x480',
+    '-b:a:1', '96k',
 
-    '-bf',
-    '0',
-
-    '-sc_threshold',
-    '0',
-
-    // 2-second GOP for 2-second HLS segments
-    '-g',
-    '60',
-
-    '-keyint_min',
-    '60',
-
-    '-force_key_frames',
-    'expr:gte(t,n_forced*2)',
-
-    // ─────────────────────────────
-    // 720p
-    // ─────────────────────────────
-    '-map',
-    '0:v:0',
-
-    '-map',
-    '0:a:0?',
-
-    // ─────────────────────────────
-    // 480p
-    // ─────────────────────────────
-    '-map',
-    '0:v:0',
-
-    '-map',
-    '0:a:0?',
-
-    '-c:v',
-    'libx264',
-
-    '-c:a',
-    'aac',
-
-    '-ar',
-    '48000',
-
-    // 720p
-    '-b:v:0',
-    '3000k',
-
-    '-maxrate:v:0',
-    '3210k',
-
-    '-bufsize:v:0',
-    '4500k',
-
-    '-s:v:0',
-    '1280x720',
-
-    '-b:a:0',
-    '128k',
-
-    // 480p
-    '-b:v:1',
-    '1200k',
-
-    '-maxrate:v:1',
-    '1284k',
-
-    '-bufsize:v:1',
-    '1800k',
-
-    '-s:v:1',
-    '854x480',
-
-    '-b:a:1',
-    '96k',
-
-    // ─────────────────────────────
-    // Low-latency HLS
-    // ─────────────────────────────
-    '-f',
-    'hls',
-
-    // 2-second segment duration (optimal for smooth streaming without buffering)
-    '-hls_time',
-    '2',
-
-    // Keep 5 segments (10s sliding window) to prevent player buffer starvation
-    '-hls_list_size',
-    '5',
-
-    '-hls_flags',
-    'delete_segments+independent_segments',
-
-    '-master_pl_name',
-    'master.m3u8',
-
-    '-hls_segment_filename',
-    path.join(
-      outputDir,
-      'v%v_seg_%06d.ts',
-    ),
-
-    '-var_stream_map',
-    'v:0,a:0,name:720p v:1,a:1,name:480p',
-
-    path.join(
-      outputDir,
-      'v%v.m3u8',
-    ),
+    // HLS packaging options
+    '-f', 'hls',
+    '-hls_time', '2',
+    '-hls_list_size', '10', // Expanded window size to prevent buffer underflow
+    '-hls_flags', 'delete_segments+independent_segments+omit_endlist',
+    '-master_pl_name', 'master.m3u8',
+    '-hls_segment_filename', path.join(outputDir, 'v%v_seg_%06d.ts'),
+    '-var_stream_map', 'v:0,a:0,name:720p v:1,a:1,name:480p',
+    path.join(outputDir, 'v%v.m3u8'),
   ];
 }
 
@@ -454,13 +350,12 @@ function startOutputDirWatcher(session) {
   let debounceTimer = null;
   try {
     const watcher = fs.watch(session.outputDir, (_eventType, filename) => {
-      if (!filename) return;
-      if (filename.endsWith('.tmp')) return; // Ignore temporary FFmpeg chunks
+      if (!filename || filename.endsWith('.tmp')) return;
       if (filename.endsWith('.m3u8') || filename.endsWith('.ts') || filename.endsWith('.m4s')) {
         if (debounceTimer) clearTimeout(debounceTimer);
         debounceTimer = setTimeout(() => {
           void enqueueGcsSync(session);
-        }, 50); // Immediate 50ms upload trigger upon file generation
+        }, 100);
       }
     });
     watcher.on('error', (err) => {
@@ -472,7 +367,6 @@ function startOutputDirWatcher(session) {
     return null;
   }
 }
-
 
 function isFfmpegAvailable() {
   if (ffmpegAvailableCache !== null) return ffmpegAvailableCache;
@@ -510,9 +404,7 @@ app.use('/hls', (req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', '*');
-  if (req.method === 'OPTIONS') {
-    return res.sendStatus(204);
-  }
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
 
   if (req.path.endsWith('.m3u8')) {
     res.setHeader('Cache-Control', 'no-cache, no-store, max-age=0, must-revalidate');
@@ -526,7 +418,6 @@ app.post('/transcode/start', async (req, res) => {
   const streamId = Number(req.body?.streamId || req.body?.stream_id);
   const streamKey = String(req.body?.streamKey || req.body?.stream_key || '');
 
-  // Fallbacks: if parameters are not present in request body, fall back to environment variables or defaults
   const rtmpInputBase = String(
     req.body?.rtmpInputBase ||
     req.body?.rtmp_input_base ||
@@ -551,7 +442,6 @@ app.post('/transcode/start', async (req, res) => {
     ''
   ).trim();
 
-  // Mock a temporary session object for logging the incoming request validation status
   const tempSession = {
     streamId: streamId || 0,
     streamKey,
@@ -567,7 +457,7 @@ app.post('/transcode/start', async (req, res) => {
   }
 
   if (!isFfmpegAvailable()) {
-    logSessionError(tempSession, 'FFmpeg not available, cannot start stream');
+    logSessionError(tempSession, 'FFmpeg not available');
     return res.status(500).json({
       error: 'ffmpeg binary not found. Install ffmpeg or run Server B via docker image.',
     });
@@ -581,13 +471,11 @@ app.post('/transcode/start', async (req, res) => {
   const outputDir = outputDirForStream(streamId);
   tempSession.outputDir = outputDir;
 
-  logSession(tempSession, 'Preparing output directory');
   cleanupOldArchives();
   if (fs.existsSync(outputDir)) {
     removeDir(outputDir);
   }
   fs.mkdirSync(outputDir, { recursive: true });
-  logSession(tempSession, 'Output directory ready');
 
   const session = {
     streamId,
@@ -613,12 +501,10 @@ app.post('/transcode/start', async (req, res) => {
   const ffmpegProcess = startFfmpegSession(session);
   session.ffmpegProcess = ffmpegProcess;
   session.watcher = startOutputDirWatcher(session);
-  logSession(session, 'FFmpeg process spawned & directory watcher active');
 
   session.interval = setInterval(() => {
     void sendHeartbeat(session);
   }, HEARTBEAT_INTERVAL_MS);
-  logSession(session, `Heartbeat interval established: ${HEARTBEAT_INTERVAL_MS}ms`);
 
   ffmpegProcess.on('exit', (code) => {
     const current = sessions.get(streamId);
@@ -636,9 +522,6 @@ app.post('/transcode/start', async (req, res) => {
   });
 
   sessions.set(streamId, session);
-  logSession(session, 'Transcode session registered');
-
-  logSession(session, 'Sending first heartbeat for new session');
   await sendHeartbeat(session);
   await notifyStreamStarted(session);
 
@@ -653,14 +536,11 @@ app.post('/transcode/stop', async (req, res) => {
   const streamId = Number(req.body?.streamId || req.body?.stream_id);
 
   if (!streamId) {
-    console.error('[worker] Invalid stop request payload: streamId is missing');
     return res.status(400).json({ error: 'streamId is required' });
   }
 
   const session = sessions.get(streamId);
   if (!session) {
-    console.log(`[worker][streamId:${streamId}] No active session found to stop. Triggering mock callback.`);
-    // Derive callback parameters if possible, otherwise use fallback defaults
     const callbackBaseUrl = String(
       req.body?.callbackBaseUrl ||
       req.body?.callback_base_url ||
@@ -672,20 +552,12 @@ app.post('/transcode/stop', async (req, res) => {
     return res.status(200).json({ success: true, stream_id: streamId, status: 'already_stopped' });
   }
 
-  logSession(session, 'Stopping active session');
-  try {
-    clearInterval(session.interval);
-  } catch {
-    /* ignore */
-  }
-  logSession(session, 'Heartbeat interval cleared');
+  try { clearInterval(session.interval); } catch { }
   try {
     if (!session.ffmpegProcess.killed) {
-      logSession(session, 'Sending SIGTERM to FFmpeg process');
       session.ffmpegProcess.kill('SIGTERM');
       setTimeout(() => {
         if (!session.ffmpegProcess.killed) {
-          logSession(session, 'SIGTERM did not stop FFmpeg; sending SIGKILL');
           session.ffmpegProcess.kill('SIGKILL');
         }
       }, 2000);
@@ -696,7 +568,6 @@ app.post('/transcode/stop', async (req, res) => {
   }
 
   await finalizeTranscodeSession(streamId, session, 0);
-  logSession(session, 'Stream ended notification sent');
 
   return res.status(200).json({
     success: true,
